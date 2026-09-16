@@ -1,0 +1,623 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+import asyncio
+import logging
+import multiprocessing
+import os
+import platform
+import signal
+import socket
+import subprocess
+import sys
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from multiprocessing.context import SpawnProcess
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+import pytest
+import pytest_asyncio
+from aiperf_mock_server import MockServerConfig
+from aiperf_mock_server import serve as aiperf_mock_server_serve
+
+from aiperf.common.logging import AIPerfLogger
+from tests.harness.subprocess import _new_process_group_kwargs
+from tests.harness.utils import (
+    AIPerfCLI,
+    AIPerfMockServer,
+    AIPerfResults,
+    AIPerfRunnerFn,
+    AIPerfRunnerResult,
+)
+
+logging.getLogger("faker").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.INFO)
+
+# Limit glibc malloc arenas to avoid a rare heap-corruption SIGABRT seen
+# during subprocess shutdown under heavy `-n auto` xdist load. Spawning
+# ~7 aiperf processes × ~24 xdist workers creates enough fork/thread
+# contention to occasionally trip glibc's double-free detector during C
+# extension teardown. Bounding arenas fixes it without user-visible cost.
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+
+# MLflow 3.x put the filesystem (file://) tracking backend into "maintenance
+# mode" and raises unless this opt-out is set. The MLflow exporter integration
+# tests use file:// stores under tmp_path, so without this they fail with
+# MlflowException and write zero runs. The exporter itself works fine against a
+# file store once opted in. setdefault so an explicit override still wins.
+os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+
+_logger = AIPerfLogger(__name__)
+
+
+@dataclass(frozen=True)
+class IntegrationTestDefaults:
+    """Default test parameters."""
+
+    # Default model to use for integration tests.
+    # Note that the openai/gpt-oss-120b model crashes on macOS for some reason.
+    # Defining the default model differently so we can have more variety in the tests.
+    if platform.system() == "Darwin":
+        model = "Qwen/Qwen3-0.6B"
+        tokenizer = "Qwen/Qwen3-0.6B"
+    else:
+        model = "openai/gpt-oss-120b"
+        tokenizer = "openai/gpt-oss-120b"
+    workers_max: int = 1
+    concurrency: int = 2
+    request_count: int = 10
+    # 900s accommodates slow Windows multiprocessing.spawn on Python 3.13.
+    # Per-iteration cost on Windows after the SO_SNDBUF/SO_RCVBUF fix:
+    # ~15s on Py 3.10, ~33s on Py 3.13. Long sweeps + streaming need:
+    #   - test_sweep_with_confidence_repeated_mode (9 iter): ~298s on VDI
+    #   - test_sweep_level_statistics (12 iter): ~400-700s on VDI
+    #   - test_aggregate_file_generation (multi-iter sweep): >600s on VDI
+    #   - test_basic_mooncake_trace_with_input_length: ~441s on VDI
+    #     (5 sequential streaming responses, up to 794 SSE chunks each;
+    #     Windows TCP loopback is much slower per-chunk than POSIX —
+    #     root cause tracked separately)
+    # Pair with pytest --timeout >= 915 so the in-fixture
+    # SIGINT/terminate/kill cascade fires before pytest gives up. POSIX runs
+    # are unaffected — single-shot tests still finish in seconds.
+    timeout: float = 900.0
+    ui: str = "simple"
+
+
+def _needs_tokenizer(args: list[str]) -> bool:
+    """Check if the endpoint type in the args requires a tokenizer."""
+    try:
+        idx = args.index("--endpoint-type")
+        endpoint_type = args[idx + 1]
+    except (ValueError, IndexError):
+        return True
+
+    from aiperf.plugin import plugins
+
+    try:
+        meta = plugins.get_endpoint_metadata(endpoint_type)
+    except Exception:
+        return True
+    return meta.tokenizes_input or meta.produces_tokens
+
+
+@pytest.fixture(scope="package", autouse=True)
+def setup_integration_tokenizer():
+    """Set up tokenizer caching for integration tests.
+
+    This fixture runs once per test session and:
+    1. Pre-caches the default tokenizer to avoid 429 rate limits
+    2. Enables offline mode to prevent network requests during tests
+
+    This prevents 429 rate limiting errors from HuggingFace when running
+    many integration tests that load tokenizers.
+    """
+    # Check if offline mode is explicitly disabled (for CI cache warming)
+    if bool(os.environ.get("AIPERF_SKIP_HF_OFFLINE", False)):
+        _logger.info("HuggingFace offline mode disabled via AIPERF_SKIP_HF_OFFLINE")
+        yield
+        return
+
+    # Pre-cache the tokenizer before enabling offline mode
+    # This ensures the tokenizer is available for offline use
+    try:
+        from aiperf.common.tokenizer import Tokenizer
+
+        tokenizer_name = IntegrationTestDefaults.tokenizer
+        _logger.info(f"Pre-caching tokenizer for integration tests: {tokenizer_name}")
+        Tokenizer.from_pretrained(tokenizer_name)
+        Tokenizer.from_pretrained("gpt2")  # used by a lot of tests
+        _logger.info("Tokenizer cached successfully")
+    except Exception as e:
+        _logger.warning(f"Failed to pre-cache tokenizer: {e}")
+        # Don't enable offline mode if caching failed
+        yield
+        return
+
+    # Enable offline mode for all subsequent tokenizer loads
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    _logger.info("HuggingFace offline mode enabled for integration tests")
+
+    yield
+
+    # Restore original environment (optional, session scope so not strictly needed)
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-retry integration tests on Windows to absorb parallel-race flakes.
+
+    On Windows under xdist `-n4`, the registration race fixed in
+    multiprocess_service_manager.py is mostly resolved but can still
+    surface under heavy CPU contention (4 simultaneous aiperf processes,
+    each spawning 5-10 service subprocesses via multiprocessing.spawn).
+    Every flaky test verified to pass solo also passed solo here — they
+    fail only in parallel. Retry up to 2 times to mask that residual
+    contention. Linux runs are unaffected (no marker added there).
+    """
+    if sys.platform != "win32":
+        return
+    flaky = pytest.mark.flaky(reruns=2, reruns_delay=5)
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(flaky)
+
+
+def pytest_runtest_setup(item):
+    """Print test name before running each test."""
+    if item.config.getoption("verbose") > 0:
+        print(f"\n{'=' * 80}")
+        print(f"STARTING: {item.nodeid}")
+        print(f"{'=' * 80}")
+
+
+def pytest_runtest_teardown(item):
+    """Print test result after running each test."""
+    if item.config.getoption("verbose") > 0:
+        print(f"\n{'=' * 80}")
+        print(f"FINISHED: {item.nodeid}")
+        print(f"{'=' * 80}\n")
+
+
+def _terminate_process_tree(pid: int, timeout_s: float = 5.0) -> None:
+    """Terminate a process and every descendant. Cross-platform.
+
+    On Linux/macOS, ``Process.terminate()`` only sends SIGTERM to the parent
+    — child processes are reparented to init and continue running. On
+    Windows, ``TerminateProcess`` similarly doesn't touch the parent's
+    children. Both leak orphans for our test harness, which then prevents
+    pytest from exiting (the multiprocessing resource tracker waits for
+    them).
+
+    Walk the process tree via psutil, send terminate, then escalate to kill
+    after the timeout.
+    """
+    import psutil
+
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+
+    try:
+        children = parent.children(recursive=True)
+    except psutil.NoSuchProcess:
+        children = []
+
+    # Terminate children first so the parent doesn't try to spawn replacements.
+    for child in children:
+        with suppress(psutil.NoSuchProcess):
+            child.terminate()
+
+    with suppress(psutil.NoSuchProcess):
+        parent.terminate()
+
+    # Wait for graceful exit, then escalate.
+    _gone, alive = psutil.wait_procs([parent, *children], timeout=timeout_s)
+    for proc in alive:
+        with suppress(psutil.NoSuchProcess):
+            proc.kill()
+
+
+def _cancel_aiperf_for_timeout(process: asyncio.subprocess.Process) -> None:
+    """Cancel a timed-out AIPerf subprocess in a platform-correct way.
+
+    On Linux/macOS, send SIGINT so AIPerf's signal handler runs cleanup and
+    flushes partial logs before exiting. On Windows, ``process.send_signal``
+    rejects SIGINT with ``ValueError: Unsupported signal: 2`` because the
+    asyncio Popen wrapper only allows SIGTERM, CTRL_C_EVENT, and
+    CTRL_BREAK_EVENT. We're already in the timeout branch (test is failing),
+    so graceful shutdown is not required — fall back to ``terminate()``.
+    """
+    if sys.platform == "win32":
+        process.terminate()
+    else:
+        process.send_signal(signal.SIGINT)
+
+
+def get_venv_python() -> str:
+    """Get the Python executable from the virtual environment."""
+    # Check if we're in a virtual environment
+    venv_path = os.environ.get("VIRTUAL_ENV")
+    if venv_path:
+        python_path = Path(venv_path) / "bin" / "python"
+        if python_path.exists():
+            return str(python_path)
+    # Fall back to sys.executable if not in a venv
+    return sys.executable
+
+
+def _killpg(process: asyncio.subprocess.Process, sig: int) -> None:
+    """Send `sig` to the entire process group of `process`.
+
+    aiperf spawns its system_controller + managers + workers as multiprocessing
+    children. Signalling only the leader (process.kill/terminate) on SIGKILL
+    skips multiprocessing's atexit cleanup and orphans the whole tree, which
+    then lingers indefinitely holding swap. The subprocess must be started in a
+    new process group for this to reach the descendants.
+    """
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, sig)
+
+
+@asynccontextmanager
+async def create_server(**kwargs: Any) -> AsyncIterator[AIPerfMockServer]:
+    # Get a fresh port for each server
+
+    mp_ctx = multiprocessing.get_context("spawn")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    host = "127.0.0.1"
+    url = f"http://{host}:{port}"
+
+    os.environ["AIPERF_SERVER_METRICS_COLLECTION_FLUSH_PERIOD"] = "0"
+
+    no_tokenizer = kwargs.pop("no_tokenizer", True)
+    process: SpawnProcess = mp_ctx.Process(
+        target=aiperf_mock_server_serve,
+        kwargs={
+            "config": MockServerConfig(
+                host=host, port=port, no_tokenizer=no_tokenizer, **kwargs
+            )
+        },
+        daemon=False,
+    )
+
+    process.start()
+
+    try:
+        # Wait for server to be ready
+        async with aiohttp.ClientSession() as session:
+            for _ in range(100):
+                try:
+                    async with session.get(
+                        f"{url}/health", timeout=aiohttp.ClientTimeout(total=2)
+                    ) as resp:
+                        if resp.status == 200:
+                            break
+                    if process.exitcode is not None:
+                        raise RuntimeError(
+                            f"AIPerf Mock Server failed to start (exit code: {process.poll()})"
+                        )
+                except (TimeoutError, aiohttp.ClientError):
+                    pass
+                await asyncio.sleep(0.1)
+            else:
+                # Loop completed without break - all health checks failed
+                if process.exitcode is None:
+                    # See _terminate_process_tree comment for why we walk
+                    # children rather than just terminating the master.
+                    await asyncio.to_thread(_terminate_process_tree, process.pid, 5.0)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(process.join, timeout=5.0),
+                            timeout=5.0,
+                        )
+                    except TimeoutError:
+                        process.kill()
+                raise RuntimeError(
+                    f"AIPerf Mock Server failed to become healthy after 100 attempts "
+                    f"(URL: {url}/health)"
+                )
+
+            # Wait for DCGM endpoints to be ready
+            for _ in range(100):
+                try:
+                    async with session.get(
+                        f"{url}/dcgm1/metrics",
+                        timeout=aiohttp.ClientTimeout(total=2),
+                    ) as resp:
+                        if resp.status == 200:
+                            break
+                except (TimeoutError, aiohttp.ClientError):
+                    pass
+                await asyncio.sleep(0.1)
+            else:
+                # log warning but continue so that we have visibility but not fail the test
+                _logger.warning(
+                    f"DCGM endpoints not ready after 100 attempts (URL: {url}/dcgm1/metrics). "
+                    f"GPU telemetry tests may fail."
+                )
+
+        yield AIPerfMockServer(host=host, port=port, url=url, process=process)
+
+    finally:
+        if process.exitcode is None:
+            # Terminate the entire process tree — uvicorn's master spawns
+            # ``workers`` child processes which are NOT killed by terminating
+            # the master alone. Without this, leaked uvicorn workers keep
+            # pytest's main process alive forever after a test finishes
+            # (hangs cleanup on Windows in particular).
+            await asyncio.to_thread(_terminate_process_tree, process.pid, 5.0)
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(process.join, timeout=5.0),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                process.kill()
+
+
+@pytest.fixture
+def mock_server_factory() -> Callable[..., AsyncIterator[AIPerfMockServer]]:
+    """Factory fixture for creating mock servers with custom CLI args.
+
+    Usage in tests:
+        async def test_custom_latency(mock_server_factory):
+            async with mock_server_factory(ttft=100, itl=50) as server:
+                # server has custom latency settings
+                ...
+
+        async def test_with_error_injection(mock_server_factory):
+            async with mock_server_factory(fast=True, error_rate=10) as server:
+                # server has 10% error rate
+                ...
+    """
+    return create_server
+
+
+@pytest_asyncio.fixture(scope="package", loop_scope="package")
+async def aiperf_mock_server() -> AsyncGenerator[AIPerfMockServer, None]:
+    """Start AIPerf Mock Server for testing.
+
+    This fixture starts a mock server with 8 workers and fast mode enabled.
+    It will be shared across all tests that need a mock server, except for tests that need a custom mock server,
+    which will use the mock_server_factory fixture.
+    """
+    async with create_server(fast=True, workers=8) as server:
+        yield server
+
+
+@pytest.fixture
+def temp_output_dir(tmp_path: Path) -> Path:
+    """Temporary directory for AIPerf output."""
+    output_dir = tmp_path / "aiperf_output"
+    output_dir.mkdir()
+    return output_dir
+
+
+@pytest.fixture
+async def aiperf_runner(
+    temp_output_dir: Path,
+) -> AIPerfRunnerFn:
+    """AIPerf subprocess runner."""
+
+    async def runner(
+        args: list[str], timeout: float = IntegrationTestDefaults.timeout
+    ) -> AIPerfRunnerResult:
+        full_args = args
+        # Only add --artifact-dir for profile command (not for plot)
+        if args and args[0] == "profile":
+            full_args += [
+                "--artifact-dir",
+                str(temp_output_dir),
+            ]
+            # Add default tokenizer if not specified to use pre-cached tokenizer
+            # This avoids 429 rate limiting from HuggingFace during tests
+            if "--tokenizer" not in args and _needs_tokenizer(args):
+                full_args += [
+                    "--tokenizer",
+                    IntegrationTestDefaults.model,
+                ]
+        python_exe = get_venv_python()
+        cmd = [python_exe, "-m", "aiperf"] + full_args
+
+        env = {
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+        }
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            **_new_process_group_kwargs(),
+        )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+        except TimeoutError as e:
+            _logger.warning(f"AIPerf timed out after {timeout}s, sending SIGINT")
+            _cancel_aiperf_for_timeout(process)
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(), timeout=5
+                )
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+            except TimeoutError:
+                _logger.warning(
+                    "Process did not exit after SIGINT, sending SIGTERM to process group"
+                )
+                _killpg(process, signal.SIGTERM)
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=5
+                    )
+                    stdout = stdout_bytes.decode("utf-8", errors="replace")
+                    stderr = stderr_bytes.decode("utf-8", errors="replace")
+                except TimeoutError:
+                    _logger.warning(
+                        "Process did not exit after SIGTERM, sending SIGKILL to process group"
+                    )
+                    _killpg(process, signal.SIGKILL)
+                    stdout = ""
+                    stderr = ""
+            raise RuntimeError(f"AIPerf timed out after {timeout}s") from e
+
+        return AIPerfRunnerResult(
+            exit_code=process.returncode or 0,
+            output_dir=temp_output_dir,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    return runner
+
+
+@pytest.fixture
+def cli(
+    aiperf_runner: AIPerfRunnerFn,
+) -> AIPerfCLI:
+    """AIPerf CLI wrapper."""
+    return AIPerfCLI(aiperf_runner)
+
+
+class AIPerfSignalCLI:
+    """CLI wrapper with SIGINT signal support for testing Ctrl+C cancellation.
+
+    Note: This class does not inherit from AIPerfCLI because it needs different
+    subprocess handling (stdout capture, delayed SIGINT). It uses AIPerfCLI._parse_command
+    as a static method for command parsing.
+    """
+
+    def __init__(
+        self,
+        temp_output_dir: Path,
+    ) -> None:
+        self._temp_output_dir = temp_output_dir
+
+    async def run_with_sigint(
+        self,
+        command: str,
+        sigint_delay: float | None = None,
+        timeout: float = IntegrationTestDefaults.timeout,
+        wait_for_profiling: bool = False,
+    ) -> AIPerfResults:
+        """Run aiperf command and send SIGINT after specified delay or when profiling starts.
+
+        Args:
+            command: The aiperf command to run
+            sigint_delay: Seconds to wait before sending SIGINT (ignored if wait_for_profiling=True)
+            timeout: Total command timeout
+            wait_for_profiling: If True, wait for "AIPerf is PROFILING" log before sending SIGINT
+
+        Returns:
+            AIPerfResults object containing output artifacts
+        """
+        args = AIPerfCLI._parse_command(command)
+        full_args = args + [
+            "--artifact-dir",
+            str(self._temp_output_dir),
+        ]
+        # Add default tokenizer if not specified to use pre-cached tokenizer
+        if "--tokenizer" not in args and _needs_tokenizer(args):
+            full_args += [
+                "--tokenizer",
+                IntegrationTestDefaults.model,
+            ]
+        python_exe = get_venv_python()
+        cmd = [python_exe, "-m", "aiperf"] + full_args
+
+        env = {
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+        }
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            **_new_process_group_kwargs(),
+        )
+
+        try:
+            if wait_for_profiling:
+                # Read stdout line by line and wait for profiling to start
+                _logger.info("Waiting for AIPerf to start profiling...")
+                profiling_started = False
+                while not profiling_started and process.returncode is None:
+                    try:
+                        # Read a line with timeout to avoid blocking forever
+                        line = await asyncio.wait_for(
+                            process.stdout.readline(), timeout=1.0
+                        )
+                        if not line:
+                            break
+                        line_str = line.decode().strip()
+                        print(line_str)
+                        if "AIPerf System is PROFILING" in line_str:
+                            _logger.info(
+                                "AIPerf profiling started, waiting for delay..."
+                            )
+                            profiling_started = True
+                            break
+                    except TimeoutError:
+                        # Timeout reading line, continue checking
+                        continue
+
+                if not profiling_started:
+                    _logger.warning(
+                        "AIPerf profiling message not found, sending SIGINT anyway"
+                    )
+                elif sigint_delay and sigint_delay > 0:
+                    # Wait for the additional delay after profiling starts
+                    await asyncio.sleep(sigint_delay)
+                    _logger.info(
+                        f"Sending SIGINT after {sigint_delay}s delay following profiling start"
+                    )
+                else:
+                    _logger.info("Sending SIGINT immediately after profiling started")
+            else:
+                # Wait for the delay before sending SIGINT
+                await asyncio.sleep(sigint_delay)
+
+            if process.returncode is None:
+                process.send_signal(signal.SIGINT)
+
+                # Wait for graceful shutdown
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=30.0)
+                except TimeoutError:
+                    _logger.warning(
+                        "Process did not exit after SIGINT, sending SIGKILL to process group"
+                    )
+                    _killpg(process, signal.SIGKILL)
+                    await process.wait()
+
+        except asyncio.CancelledError:
+            _killpg(process, signal.SIGKILL)
+            await process.wait()
+            raise
+
+        return AIPerfResults(
+            AIPerfRunnerResult(process.returncode or 0, self._temp_output_dir)
+        )
+
+
+@pytest.fixture
+def signal_cli(temp_output_dir: Path) -> AIPerfSignalCLI:
+    """AIPerf CLI wrapper with SIGINT signal support."""
+    return AIPerfSignalCLI(temp_output_dir)

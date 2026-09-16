@@ -1,0 +1,1069 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import base64
+import json
+
+import pytest
+
+from aiperf.common.enums import ConversationContextMode
+from aiperf.common.models import Image, Text
+from aiperf.config import BenchmarkRun
+from aiperf.config.flags.cli_config import CLIConfig
+from aiperf.dataset.loader.models import SingleTurn
+from aiperf.dataset.loader.single_turn import SingleTurnDatasetLoader
+from aiperf.plugin.enums import CustomDatasetType
+from tests.unit.conftest import make_run_from_cli
+
+
+class TestSingleTurn:
+    """Basic functionality tests for SingleTurn model."""
+
+    def test_create_with_text_only(self):
+        """Test creating SingleTurn with text."""
+        data = SingleTurn(text="What is deep learning?")
+
+        assert data.text == "What is deep learning?"
+        assert data.texts is None
+        assert data.type == CustomDatasetType.SINGLE_TURN
+
+    def test_single_turn_accepts_extra(self):
+        data = SingleTurn(
+            text="What is deep learning?",
+            extra={"top_p": 0.9, "seed": 42},
+        )
+        assert data.extra == {"top_p": 0.9, "seed": 42}
+
+    def test_single_turn_extra_defaults_to_none(self):
+        data = SingleTurn(text="What is deep learning?")
+        assert data.extra is None
+
+    def test_create_with_multimodal_data(self):
+        """Test creating SingleTurn with text and image."""
+        data = SingleTurn(
+            text="What is in the image?",
+            image="https://example.com/image.png",
+            audio="https://example.com/audio.wav",
+        )
+
+        assert data.text == "What is in the image?"
+        assert data.texts is None
+        assert data.image == "https://example.com/image.png"
+        assert data.images is None
+        assert data.audio == "https://example.com/audio.wav"
+        assert data.audios is None
+
+    def test_create_with_batched_inputs(self):
+        """Test creating SingleTurn with batched inputs."""
+        data = SingleTurn(
+            texts=["What is the weather today?", "What is deep learning?"],
+            images=["https://example.com/image1.png", "https://example.com/image2.png"],
+        )
+
+        assert data.texts == ["What is the weather today?", "What is deep learning?"]
+        assert data.images == [
+            "https://example.com/image1.png",
+            "https://example.com/image2.png",
+        ]
+        assert data.audios is None
+
+    def test_create_with_fixed_schedule(self):
+        """Test creating SingleTurn with fixed schedule (timestamp)."""
+        data = SingleTurn(text="What is deep learning?", timestamp=1000)
+
+        assert data.text == "What is deep learning?"
+        assert data.timestamp == 1000
+        assert data.delay is None
+
+    def test_create_with_output_length(self):
+        """Test creating SingleTurn with output_length."""
+        data = SingleTurn(text="Write a haiku.", output_length=50)
+
+        assert data.text == "Write a haiku."
+        assert data.output_length == 50
+
+    def test_create_with_output_length_default_is_none(self):
+        """Test that output_length defaults to None."""
+        data = SingleTurn(text="Hello")
+
+        assert data.output_length is None
+
+    def test_create_with_output_length_zero_raises(self):
+        """Test that output_length=0 raises validation error."""
+        with pytest.raises(ValueError):
+            SingleTurn(text="Hello", output_length=0)
+
+    def test_create_with_output_length_negative_raises(self):
+        """Test that negative output_length raises validation error."""
+        with pytest.raises(ValueError):
+            SingleTurn(text="Hello", output_length=-1)
+
+    def test_create_with_delay(self):
+        """Test creating SingleTurn with delay."""
+        data = SingleTurn(text="Who are you?", delay=1234)
+
+        assert data.text == "Who are you?"
+        assert data.delay == 1234
+        assert data.timestamp is None
+
+    def test_create_with_full_featured_version(self):
+        """Test creating SingleTurn with full-featured version."""
+        data = SingleTurn(
+            texts=[
+                Text(name="text_field_A", contents=["Hello", "World"]),
+                Text(name="text_field_B", contents=["Hi there"]),
+            ],
+            images=[
+                Image(
+                    name="image_field_A",
+                    contents=["https://example.com/1.png", "https://example.com/2.png"],
+                ),
+                Image(name="image_field_B", contents=["https://example.com/3.png"]),
+            ],
+        )
+
+        assert len(data.texts) == 2
+        assert len(data.images) == 2
+        assert data.audios is None
+
+        assert data.texts[0].name == "text_field_A"
+        assert data.texts[0].contents == ["Hello", "World"]
+        assert data.texts[1].name == "text_field_B"
+        assert data.texts[1].contents == ["Hi there"]
+
+        assert data.images[0].name == "image_field_A"
+        assert data.images[0].contents == [
+            "https://example.com/1.png",
+            "https://example.com/2.png",
+        ]
+        assert data.images[1].name == "image_field_B"
+        assert data.images[1].contents == ["https://example.com/3.png"]
+
+    def test_validation_errors(self):
+        """Test that at least one modality must be provided."""
+        # No modality provided
+        with pytest.raises(ValueError):
+            SingleTurn()
+
+    @pytest.mark.parametrize(
+        "text, texts, image, images, audio, audios, timestamp, delay",
+        [
+            ("foo", ["bar"], None, None, None, None, None, None),  # text and texts
+            (None, None, "foo", ["bar"], None, None, None, None),  # image and images
+            (None, None, None, None, "foo", ["bar"], None, None),  # audio and audios
+            (None, None, None, None, None, None, 1000, 500),  # timestamp and delay
+        ],
+    )
+    def test_validation_mutual_exclusion(
+        self, text, texts, image, images, audio, audios, timestamp, delay
+    ):
+        """Test that mutual exclusion among fields is preserved."""
+        with pytest.raises(ValueError):
+            SingleTurn(
+                text=text,
+                texts=texts,
+                image=image,
+                images=images,
+                audio=audio,
+                audios=audios,
+                timestamp=timestamp,
+                delay=delay,
+            )
+
+
+class TestSingleTurnDatasetLoader:
+    """Basic functionality tests for SingleTurnDatasetLoader."""
+
+    def test_load_dataset_basic_functionality(self, create_jsonl_file, default_cfg):
+        """Test basic JSONL file loading."""
+        content = [
+            '{"text": "What is deep learning?"}',
+            '{"text": "What is in the image?", "image": "https://example.com/image.png"}',
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        dataset = loader.load_dataset()
+
+        assert isinstance(dataset, dict)
+        assert len(dataset) == 2
+
+        # Check that each session has single turn
+        for _, turns in dataset.items():
+            assert len(turns) == 1
+
+        turn1, turn2 = list(dataset.values())
+        assert turn1[0].text == "What is deep learning?"
+        assert turn1[0].image is None
+        assert turn1[0].audio is None
+
+        assert turn2[0].text == "What is in the image?"
+        assert turn2[0].image == "https://example.com/image.png"
+        assert turn2[0].audio is None
+
+    def test_load_dataset_skips_empty_lines(self, create_jsonl_file, default_cfg):
+        """Test that empty lines are skipped."""
+        content = [
+            '{"text": "Hello"}',
+            "",  # Empty line
+            '{"text": "World"}',
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        dataset = loader.load_dataset()
+
+        assert len(dataset) == 2  # Should skip empty line
+
+    def test_load_dataset_with_batched_inputs(self, create_jsonl_file, default_cfg):
+        """Test loading dataset with batched inputs."""
+        content = [
+            '{"texts": ["What is the weather?", "What is AI?"], "images": ["https://example.com/1.png", "https://example.com/2.png"]}',
+            '{"texts": ["Summarize the podcast", "What is audio about?"], "audios": ["https://example.com/3.wav", "https://example.com/4.wav"]}',
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        dataset = loader.load_dataset()
+
+        # Check that there are two sessions
+        assert len(dataset) == 2
+
+        turn1, turn2 = list(dataset.values())
+        assert turn1[0].texts == ["What is the weather?", "What is AI?"]
+        assert turn1[0].images == [
+            "https://example.com/1.png",
+            "https://example.com/2.png",
+        ]
+        assert turn1[0].audios is None
+
+        assert turn2[0].texts == ["Summarize the podcast", "What is audio about?"]
+        assert turn2[0].images is None
+        assert turn2[0].audios == [
+            "https://example.com/3.wav",
+            "https://example.com/4.wav",
+        ]
+
+    def test_load_dataset_with_timestamp(self, create_jsonl_file, default_cfg):
+        """Test loading dataset with timestamp field."""
+        content = [
+            '{"text": "What is deep learning?", "timestamp": 1000}',
+            '{"text": "Who are you?", "timestamp": 2000}',
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        dataset = loader.load_dataset()
+
+        assert len(dataset) == 2
+
+        turn1, turn2 = list(dataset.values())
+        assert turn1[0].text == "What is deep learning?"
+        assert turn1[0].timestamp == 1000
+        assert turn1[0].delay is None
+
+        assert turn2[0].text == "Who are you?"
+        assert turn2[0].timestamp == 2000
+        assert turn2[0].delay is None
+
+    def test_load_dataset_with_delay(self, create_jsonl_file, default_cfg):
+        """Test loading dataset with delay field."""
+        content = [
+            '{"text": "What is deep learning?", "delay": 0}',
+            '{"text": "Who are you?", "delay": 1234}',
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        dataset = loader.load_dataset()
+
+        assert len(dataset) == 2
+
+        turn1, turn2 = list(dataset.values())
+        assert turn1[0].text == "What is deep learning?"
+        assert turn1[0].delay == 0
+        assert turn1[0].timestamp is None
+
+        assert turn2[0].text == "Who are you?"
+        assert turn2[0].delay == 1234
+        assert turn2[0].timestamp is None
+
+    def test_load_dataset_with_output_length(self, create_jsonl_file, default_cfg):
+        """Test loading dataset with output_length field."""
+        content = [
+            '{"text": "Write a haiku.", "output_length": 50}',
+            '{"text": "Explain quantum computing.", "output_length": 500}',
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        dataset = loader.load_dataset()
+
+        assert len(dataset) == 2
+
+        turn1, turn2 = list(dataset.values())
+        assert turn1[0].output_length == 50
+        assert turn2[0].output_length == 500
+
+    def test_load_dataset_with_full_featured_version(
+        self, create_jsonl_file, default_cfg
+    ):
+        """Test loading dataset with full-featured version."""
+
+        content = [
+            json.dumps(
+                {
+                    "texts": [
+                        {"name": "text_field_A", "contents": ["Hello", "World"]},
+                        {"name": "text_field_B", "contents": ["Hi there"]},
+                    ],
+                    "images": [
+                        {
+                            "name": "image_field_A",
+                            "contents": [
+                                "https://example.com/1.png",
+                                "https://example.com/2.png",
+                            ],
+                        },
+                        {
+                            "name": "image_field_B",
+                            "contents": ["https://example.com/3.png"],
+                        },
+                    ],
+                }
+            )
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        dataset = loader.load_dataset()
+
+        assert len(dataset) == 1
+
+        turn = list(dataset.values())[0]
+        assert len(turn[0].texts) == 2
+        assert len(turn[0].images) == 2
+
+        assert turn[0].texts[0].name == "text_field_A"
+        assert turn[0].texts[0].contents == ["Hello", "World"]
+        assert turn[0].texts[1].name == "text_field_B"
+        assert turn[0].texts[1].contents == ["Hi there"]
+
+        assert turn[0].images[0].name == "image_field_A"
+        assert turn[0].images[0].contents == [
+            "https://example.com/1.png",
+            "https://example.com/2.png",
+        ]
+        assert turn[0].images[1].name == "image_field_B"
+        assert turn[0].images[1].contents == ["https://example.com/3.png"]
+
+
+class TestSingleTurnDatasetLoaderConvertToConversations:
+    """Test convert_to_conversations method for SingleTurnDatasetLoader."""
+
+    def test_convert_simple_text_data(self, default_cfg):
+        """Test converting simple text data to conversations."""
+        loader = SingleTurnDatasetLoader(
+            filename="dummy.jsonl", run=make_run_from_cli(default_cfg)
+        )
+        data = {
+            "session_1": [SingleTurn(text="Hello world")],
+            "session_2": [SingleTurn(text="How are you?")],
+        }
+
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 2
+        assert conversations[0].session_id == "session_1"
+        assert len(conversations[0].turns) == 1
+        assert conversations[0].turns[0].texts[0].contents == ["Hello world"]
+
+        assert conversations[1].session_id == "session_2"
+        assert len(conversations[1].turns) == 1
+        assert conversations[1].turns[0].texts[0].contents == ["How are you?"]
+
+    def test_convert_multimodal_data(self, default_cfg):
+        """Test converting multimodal data to conversations."""
+        loader = SingleTurnDatasetLoader(
+            filename="dummy.jsonl", run=make_run_from_cli(default_cfg)
+        )
+        data = {
+            "session_1": [
+                SingleTurn(
+                    text="What's in this image?",
+                    image="https://example.com/image.png",
+                    audio="https://example.com/audio.wav",
+                )
+            ]
+        }
+
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+        assert len(turn.texts) == 1
+        assert turn.texts[0].contents == ["What's in this image?"]
+        assert len(turn.images) == 1
+        assert turn.images[0].contents == ["https://example.com/image.png"]
+        assert len(turn.audios) == 1
+        assert turn.audios[0].contents == ["https://example.com/audio.wav"]
+
+    def test_convert_batched_data(self, default_cfg):
+        """Test converting batched data to conversations."""
+        loader = SingleTurnDatasetLoader(
+            filename="dummy.jsonl", run=make_run_from_cli(default_cfg)
+        )
+        data = {
+            "session_1": [
+                SingleTurn(
+                    texts=["First message", "Second message"],
+                    images=["https://example.com/1.png", "https://example.com/2.png"],
+                )
+            ]
+        }
+
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+        assert len(turn.texts) == 1
+        assert turn.texts[0].contents == ["First message", "Second message"]
+        assert len(turn.images) == 1
+        assert turn.images[0].contents == [
+            "https://example.com/1.png",
+            "https://example.com/2.png",
+        ]
+
+    def test_convert_with_timing_data(self, default_cfg):
+        """Test converting data with timestamp and delay."""
+        loader = SingleTurnDatasetLoader(
+            filename="dummy.jsonl", run=make_run_from_cli(default_cfg)
+        )
+        data = {
+            "session_1": [
+                SingleTurn(text="First", timestamp=1000),
+                SingleTurn(text="Second", delay=500, role="user"),
+            ]
+        }
+
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        assert len(conversations[0].turns) == 2
+
+        first_turn = conversations[0].turns[0]
+        assert first_turn.timestamp == 1000
+        assert first_turn.delay is None
+        assert first_turn.role is None
+
+        second_turn = conversations[0].turns[1]
+        assert second_turn.timestamp is None
+        assert second_turn.delay == 500
+        assert second_turn.role == "user"
+
+    def test_convert_with_output_length(self, default_cfg):
+        """Test converting data with output_length sets Turn.max_tokens."""
+        loader = SingleTurnDatasetLoader(
+            filename="dummy.jsonl", run=make_run_from_cli(default_cfg)
+        )
+        data = {
+            "session_1": [SingleTurn(text="Write a haiku.", output_length=50)],
+        }
+
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        assert conversations[0].turns[0].max_tokens == 50
+
+    def test_convert_without_output_length_is_none(self, default_cfg):
+        """Test converting data without output_length leaves Turn.max_tokens as None."""
+        loader = SingleTurnDatasetLoader(
+            filename="dummy.jsonl", run=make_run_from_cli(default_cfg)
+        )
+        data = {
+            "session_1": [SingleTurn(text="Hello")],
+        }
+
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        assert conversations[0].turns[0].max_tokens is None
+
+    def test_convert_multimodal_with_output_length(self, default_cfg):
+        """Test converting multimodal data with output_length sets Turn.max_tokens."""
+        loader = SingleTurnDatasetLoader(
+            filename="dummy.jsonl", run=make_run_from_cli(default_cfg)
+        )
+        data = {
+            "session_1": [
+                SingleTurn(
+                    text="Describe this image.",
+                    image="https://example.com/image.png",
+                    output_length=200,
+                )
+            ],
+        }
+
+        conversations = loader.convert_to_conversations(data)
+
+        turn = conversations[0].turns[0]
+        assert turn.max_tokens == 200
+        assert len(turn.texts) == 1
+        assert len(turn.images) == 1
+
+    def test_convert_structured_text_objects(self, default_cfg):
+        """Test converting data with structured Text objects."""
+        loader = SingleTurnDatasetLoader(
+            filename="dummy.jsonl", run=make_run_from_cli(default_cfg)
+        )
+        text_objects = [
+            Text(name="query", contents=["What is AI?"]),
+            Text(name="context", contents=["AI stands for artificial intelligence"]),
+        ]
+        data = {"session_1": [SingleTurn(texts=text_objects)]}
+
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+        assert len(turn.texts) == 2
+        assert turn.texts[0].name == "query"
+        assert turn.texts[0].contents == ["What is AI?"]
+        assert turn.texts[1].name == "context"
+        assert turn.texts[1].contents == ["AI stands for artificial intelligence"]
+
+
+class TestSingleTurnMediaEncoding:
+    """Test media file encoding functionality."""
+
+    def test_convert_local_image_to_base64(
+        self, create_jsonl_file, create_test_image, default_cfg
+    ):
+        """Test that local image files are encoded to base64 data URLs."""
+        test_image = create_test_image("test_image.jpg")
+
+        content = [json.dumps({"text": "What is in this image?", "image": test_image})]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # Check that the image was encoded
+        assert len(turn.images) == 1
+        image_content = turn.images[0].contents[0]
+
+        # Verify it's a data URL with base64 encoding
+        assert image_content.startswith("data:image/")
+        assert ";base64," in image_content
+
+        # Extract and verify the base64 content is valid
+        base64_part = image_content.split(";base64,")[1]
+        try:
+            base64.b64decode(base64_part)
+        except Exception as e:
+            pytest.fail(f"Invalid base64 encoding: {e}")
+
+    def test_url_images_not_encoded(self, create_jsonl_file, default_cfg):
+        """Test that URLs are not encoded and passed through as-is."""
+        content = [
+            json.dumps(
+                {"text": "What is this?", "image": "https://example.com/image.png"}
+            )
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # URL should remain unchanged
+        assert turn.images[0].contents[0] == "https://example.com/image.png"
+
+    def test_data_url_not_reencoded(self, create_jsonl_file, default_cfg):
+        """Test that existing data URLs are not re-encoded."""
+        data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        content = [json.dumps({"text": "Already encoded", "image": data_url})]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # Data URL should remain unchanged
+        assert turn.images[0].contents[0] == data_url
+
+    def test_multiple_images_encoded(
+        self, create_jsonl_file, create_test_image, default_cfg
+    ):
+        """Test that multiple local images are all encoded."""
+        test_image1 = create_test_image("image1.jpg")
+        test_image2 = create_test_image("image2.jpg")
+
+        content = [
+            json.dumps(
+                {"text": "What are these?", "images": [test_image1, test_image2]}
+            )
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # Both images should be encoded
+        assert len(turn.images) == 1
+        assert len(turn.images[0].contents) == 2
+
+        for image_content in turn.images[0].contents:
+            assert image_content.startswith("data:image/")
+            assert ";base64," in image_content
+
+    def test_mixed_image_sources(
+        self, create_jsonl_file, create_test_image, default_cfg
+    ):
+        """Test handling of mixed image sources (URL + local file)."""
+        test_image = create_test_image("local_image.jpg")
+
+        content = [
+            json.dumps(
+                {
+                    "text": "Mixed sources",
+                    "images": ["https://example.com/remote.png", test_image],
+                }
+            )
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        contents = turn.images[0].contents
+        assert len(contents) == 2
+
+        # URL should remain unchanged
+        assert contents[0] == "https://example.com/remote.png"
+
+        # Local file should be encoded
+        assert contents[1].startswith("data:image/")
+        assert ";base64," in contents[1]
+
+    def test_invalid_image_path_raises_error(self, create_jsonl_file, default_cfg):
+        """Test that invalid image paths raise FileNotFoundError."""
+        content = [
+            json.dumps(
+                {"text": "Invalid image", "image": "/nonexistent/path/image.png"}
+            )
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+
+        with pytest.raises(FileNotFoundError):
+            loader.convert_to_conversations(data)
+
+    def test_convert_local_audio_to_base64(
+        self, create_jsonl_file, create_test_audio, default_cfg
+    ):
+        """Test that local audio files are encoded to base64."""
+        test_audio = create_test_audio("test_audio.wav")
+
+        content = [json.dumps({"text": "What is in this audio?", "audio": test_audio})]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # Check that the audio was encoded
+        assert len(turn.audios) == 1
+        audio_content = turn.audios[0].contents[0]
+
+        # Verify it's in the format "wav,base64data"
+        assert "," in audio_content
+        format_part, base64_part = audio_content.split(",", 1)
+        assert format_part.lower() == "wav"
+
+        # Verify the base64 content is valid
+        try:
+            base64.b64decode(base64_part)
+        except Exception as e:
+            pytest.fail(f"Invalid base64 encoding: {e}")
+
+    def test_audio_url_not_encoded(self, create_jsonl_file, default_cfg):
+        """Test that audio URLs are not encoded and passed through as-is."""
+        content = [
+            json.dumps(
+                {"text": "Listen to this", "audio": "https://example.com/audio.wav"}
+            )
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # URL should remain unchanged
+        assert turn.audios[0].contents[0] == "https://example.com/audio.wav"
+
+    def test_audio_already_encoded_not_reencoded(self, create_jsonl_file, default_cfg):
+        """Test that already-encoded audio is not re-encoded."""
+        encoded_audio = "wav,SGVsbG8gV29ybGQ="  # "Hello World" in base64
+        content = [json.dumps({"text": "Already encoded", "audio": encoded_audio})]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # Encoded audio should remain unchanged
+        assert turn.audios[0].contents[0] == encoded_audio
+
+    def test_convert_local_video_to_base64(
+        self, create_jsonl_file, create_test_video, default_cfg
+    ):
+        """Test that local video files are encoded to base64 data URLs."""
+        test_video = create_test_video("test_video.mp4")
+
+        content = [json.dumps({"text": "What is in this video?", "video": test_video})]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # Check that the video was encoded
+        assert len(turn.videos) == 1
+        video_content = turn.videos[0].contents[0]
+
+        # Verify it's a data URL with base64 encoding
+        assert video_content.startswith("data:video/")
+        assert ";base64," in video_content
+
+        # Extract and verify the base64 content is valid
+        base64_part = video_content.split(";base64,")[1]
+        try:
+            base64.b64decode(base64_part)
+        except Exception as e:
+            pytest.fail(f"Invalid base64 encoding: {e}")
+
+    def test_video_url_not_encoded(self, create_jsonl_file, default_cfg):
+        """Test that video URLs are not encoded and passed through as-is."""
+        content = [
+            json.dumps({"text": "Watch this", "video": "https://example.com/video.mp4"})
+        ]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # URL should remain unchanged
+        assert turn.videos[0].contents[0] == "https://example.com/video.mp4"
+
+    def test_video_data_url_not_reencoded(self, create_jsonl_file, default_cfg):
+        """Test that existing video data URLs are not re-encoded."""
+        data_url = "data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMQ=="
+        content = [json.dumps({"text": "Already encoded", "video": data_url})]
+        filename = create_jsonl_file(content)
+
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        turn = conversations[0].turns[0]
+
+        # Data URL should remain unchanged
+        assert turn.videos[0].contents[0] == data_url
+
+
+class TestSingleTurnSessionId:
+    """Tests for session_id grouping in single-turn datasets."""
+
+    def test_session_id_field_accepted(self):
+        data = SingleTurn(text="hello", session_id="s1")
+        assert data.session_id == "s1"
+
+    def test_load_dataset_groups_by_session_id(self, create_jsonl_file, default_cfg):
+        content = [
+            '{"session_id": "s0", "text": "turn 0a"}',
+            '{"session_id": "s1", "text": "turn 1a"}',
+            '{"session_id": "s0", "text": "turn 0b"}',
+            '{"session_id": "s1", "text": "turn 1b"}',
+        ]
+        filename = create_jsonl_file(content)
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+
+        assert len(data) == 2
+        assert all(len(turns) == 2 for turns in data.values())
+
+    def test_load_dataset_mixed_session_and_no_session(
+        self, create_jsonl_file, default_cfg
+    ):
+        content = [
+            '{"session_id": "s0", "text": "grouped a"}',
+            '{"text": "standalone"}',
+            '{"session_id": "s0", "text": "grouped b"}',
+        ]
+        filename = create_jsonl_file(content)
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+
+        assert len(data) == 2
+        session_sizes = sorted(len(v) for v in data.values())
+        assert session_sizes == [1, 2]
+
+    def test_convert_grouped_session_sets_message_array_context_mode(
+        self, create_jsonl_file, default_cfg
+    ):
+        content = [
+            '{"session_id": "s0", "text": "turn a"}',
+            '{"session_id": "s0", "text": "turn b"}',
+        ]
+        filename = create_jsonl_file(content)
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        assert (
+            conversations[0].context_mode
+            == ConversationContextMode.MESSAGE_ARRAY_WITH_RESPONSES
+        )
+        assert len(conversations[0].turns) == 2
+
+    def test_convert_single_entry_session_has_no_context_mode(
+        self, create_jsonl_file, default_cfg
+    ):
+        content = ['{"text": "standalone request"}']
+        filename = create_jsonl_file(content)
+        loader = SingleTurnDatasetLoader(
+            filename=filename, run=make_run_from_cli(default_cfg)
+        )
+        data = loader.load_dataset()
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 1
+        assert conversations[0].context_mode is None
+
+
+def test_single_turn_loader_propagates_extra_to_turn(tmp_path, default_cfg):
+    path = tmp_path / "single.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "text": "Hello",
+                "extra": {"vendor_a": 1, "vendor_b": "x"},
+            }
+        )
+        + "\n"
+    )
+    loader = SingleTurnDatasetLoader(filename=path, cfg=default_cfg)
+    conversations = loader.convert_to_conversations(loader.load_dataset())
+    turn = conversations[0].turns[0]
+    assert turn.extra_body == {"vendor_a": 1, "vendor_b": "x"}
+
+
+class TestSingleTurnImageUUIDs:
+    """Tests for image cache UUID validation and load-time stripping."""
+
+    def test_image_uuid_validation(self):
+        with pytest.raises(ValueError, match="image_uuids length"):
+            SingleTurn(images=["a.png", "b.png"], image_uuids=["uuid-a"])
+
+        with pytest.raises(ValueError, match="singular image"):
+            SingleTurn(image="a.png", image_uuids=["uuid-a"])
+
+        with pytest.raises(ValueError, match="use Image.uuids"):
+            SingleTurn(
+                images=[Image(contents=["a.png"])],
+                image_uuids=["uuid-a"],
+            )
+
+        with pytest.raises(ValueError, match=r"Image\.uuids length"):
+            Image(contents=["a.png", "b.png"], uuids=["uuid-a"])
+
+        with pytest.raises(ValueError, match="must not contain empty strings"):
+            SingleTurn(images=["a.png"], image_uuids=[""])
+
+        with pytest.raises(ValueError, match="must not contain empty strings"):
+            Image(contents=["a.png"], uuids=[""])
+
+    def test_uuid_only_inputs_normalize_empty_contents(self):
+        single_turn = SingleTurn(image_uuids=["uuid-a", "uuid-b"])
+        image = Image(uuids=["uuid-a", "uuid-b"])
+
+        assert single_turn.images == ["", ""]
+        assert image.contents == ["", ""]
+
+    def test_cache_only_uuid_passes_without_prior_content(self):
+        loader = SingleTurnDatasetLoader(filename="unused", run=self._strip_run())
+        data = {"session": [SingleTurn(image_uuids=["uuid-a"])]}
+
+        image = loader.convert_to_conversations(data)[0].turns[0].images[0]
+
+        assert image.contents == [""]
+        assert image.uuids == ["uuid-a"]
+
+    def test_cache_only_uuid_passes_when_strip_disabled(self, default_cfg):
+        loader = SingleTurnDatasetLoader(
+            filename="unused", run=make_run_from_cli(default_cfg)
+        )
+        conversation = loader.convert_to_conversations(
+            {"session": [SingleTurn(image_uuids=["uuid-a"])]}
+        )
+        image = conversation[0].turns[0].images[0]
+
+        assert image.contents == [""]
+        assert image.uuids == ["uuid-a"]
+
+    def test_dedup_only_strips_uuids_seen_in_earlier_turns(self):
+        repeated = SingleTurn(
+            images=["https://example.com/a.png", "https://example.com/a.png", ""],
+            image_uuids=["uuid-a", "uuid-a", "uuid-prewarmed"],
+        )
+        later = SingleTurn(
+            images=[
+                "https://example.com/a.png",
+                "https://example.com/b.png",
+                "https://example.com/prewarmed.png",
+            ],
+            image_uuids=["uuid-a", "uuid-b", "uuid-prewarmed"],
+        )
+        loader = SingleTurnDatasetLoader(filename="unused", run=self._strip_run())
+
+        conversations = loader.convert_to_conversations(
+            {
+                "session-a": [repeated, later],
+                "session-b": [repeated.model_copy(deep=True)],
+            }
+        )
+
+        session_a = conversations[0].turns
+        session_b = conversations[1].turns
+        assert session_a[0].images[0].contents == [
+            "https://example.com/a.png",
+            "https://example.com/a.png",
+            "",
+        ]
+        assert session_a[1].images[0].contents == [
+            "",
+            "https://example.com/b.png",
+            "https://example.com/prewarmed.png",
+        ]
+        assert session_a[1].images[0].uuids == [
+            "uuid-a",
+            "uuid-b",
+            "uuid-prewarmed",
+        ]
+        assert session_b[0].images[0].contents == [
+            "https://example.com/a.png",
+            "https://example.com/a.png",
+            "",
+        ]
+
+    def test_dedup_is_disabled_by_default(self, default_cfg):
+        loader = SingleTurnDatasetLoader(
+            filename="unused", run=make_run_from_cli(default_cfg)
+        )
+        turns = loader.convert_to_conversations(
+            {
+                "session": [
+                    SingleTurn(
+                        images=["https://example.com/a.png"],
+                        image_uuids=["uuid-a"],
+                    ),
+                    SingleTurn(
+                        images=["https://example.com/a.png"],
+                        image_uuids=["uuid-a"],
+                    ),
+                ]
+            }
+        )[0].turns
+
+        assert turns[0].images[0].contents == ["https://example.com/a.png"]
+        assert turns[1].images[0].contents == ["https://example.com/a.png"]
+
+    @staticmethod
+    def _strip_run() -> BenchmarkRun:
+        return make_run_from_cli(
+            CLIConfig(model_names=["test-model"], uuid_and_strip=True)
+        )

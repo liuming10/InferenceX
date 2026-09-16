@@ -1,0 +1,107 @@
+# Contributing to InferenceX
+
+<div align="center">
+
+**English** | [中文](./CONTRIBUTING_zh.md)
+
+</div>
+
+Thanks for contributing! PRs are welcome. This page covers the review process every PR goes through before it can be merged.
+
+## PR review flow
+
+1. Open your PR and get it through PR validation. Add the `full-sweep-fail-fast` label (strongly recommended because a broken change wastes one job per matrix rather than the whole fan-out). Use `full-sweep-enabled` only if you need jobs to keep running past a failure. Let the benchmark sweep run and get a green full sweep, including evals, on a commit in your PR.
+2. Request a review from your respective company's [CODEOWNER](.github/CODEOWNERS).
+3. The CODEOWNER reviews and posts the **PR Review Checklist** sign-off (see below) in their approval comment.
+4. Only after the checklist sign-off is posted should you ping a core maintainer on Slack for final approval.
+5. An authorized maintainer posts `/reuse-sweep-run` (see below) and the PR is merged via the reuse path.
+
+**Performance changelog requirement:** Every change that can affect benchmark performance and every recipe addition or modification **MUST** append a new entry to the physical end of `perf-changelog.yaml`. Historical entries **MUST NOT** be edited.
+
+## The PR Review Checklist (CODEOWNER sign-off)
+
+When a CODEOWNER approves a PR, they must fill in the latest [PR_REVIEW_CHECKLIST.md](docs/PR_REVIEW_CHECKLIST.md) template in their approval comment.
+
+A friendly reminder. Please follow the latest checklist template **correctly**:
+
+- Always copy the template from the **current** [docs/PR_REVIEW_CHECKLIST.md](docs/PR_REVIEW_CHECKLIST.md) on `main`. The checklist evolves, and a sign-off made from a stale copy will be flagged as missing items.
+- Keep the template's opening phrase intact:
+
+  > As a PR reviewer and CODEOWNER, I have reviewed this and have:
+
+  Our CI verification workflow, [`codeowner-signoff-verify.yml`](https://github.com/SemiAnalysisAI/InferenceX/blob/main/.github/workflows/codeowner-signoff-verify.yml), triggers on exactly this phrase. **If your approval comment does not follow the checklist template, including that phrase, the sign-off verification CI will not trigger at all**, and your sign-off won't count toward merge.
+- The sign-off can be posted as a regular conversation comment, a review summary, or an inline review comment. All three trigger verification.
+- Fill in the "Additional detail section" with the links the checklist asks for (validation/eval workflow runs, the corresponding [vLLM recipe](https://github.com/vllm-project/recipes) / [SGLang cookbook](https://github.com/sgl-project/sglang/tree/main/docs_new) PR, and any exception reasoning).
+
+Once the sign-off is posted, CI independently re-verifies the claims that gate a merge, including CODEOWNER status, a green sweep and evals on a commit in the PR, the linked recipe, the `/reuse-sweep-run` command, use of the latest checklist template, upstream [vLLM](https://hub.docker.com/u/vllm)/[SGLang](https://hub.docker.com/u/lmsysorg) images, no architecture-changing benchmark hacks, and chat-template usage for speculative decoding. It then posts a verdict comment on the PR. Checkmarks are not taken on trust, so please only check items you have actually verified.
+
+## Reusing your PR's green sweep at merge with `/reuse-sweep-run`
+
+A full benchmark sweep is expensive GPU time, and the runners are shared by every open PR. Without reuse, an approved PR's sweep would run **twice**, once for PR validation and again on `main` after merge. The reuse path avoids that:
+
+- After your PR has an eligible green full sweep, an authorized maintainer (`OWNER`/`MEMBER`/`COLLABORATOR`) comments `/reuse-sweep-run` on the PR (optionally pinning a specific run: `/reuse-sweep-run <run_id>`).
+- The merge-to-`main` run then validates and ingests the PR sweep's artifacts instead of re-running the whole sweep on `main`.
+- **This reduces CI queue time for everyone.** Each reused merge frees hours of GPU runner time for other PRs, so please prefer the reuse path over merging without it. A green sweep alone is not enough. The `/reuse-sweep-run` comment must be on record (the sign-off verification checks for it), otherwise `main` silently re-runs the full sweep.
+- Reuse does not require retaining a sweep label. The bot reacts to the command with 👍 when accepted or 👎 when rejected, with details in the Actions run summary; source artifacts are revalidated at merge.
+- `utils/merge_with_reuse.sh <pr-number>` is the supported merge path. It posts the command, syncs the branch with `main`, waits for checks, and squash-merges. See the [workflows README](.github/workflows/README.md#reusing-an-approved-pr-full-sweep) for eligibility details.
+
+## Adding points to the latest curve with `append-only`
+
+When a PR only adds generated points to an existing curve, mark every new changelog
+entry with `append-only: true`. Additions may introduce new concurrency values or new
+recipe variants, such as another tensor-parallelism value. Sweep setup compares the
+generated matrices at the base and head revisions, runs only the newly added points,
+and emits metadata that lets InferenceX-app extend the most recent matching curve
+instead of presenting the partial run as a separate curve.
+
+This mode is intentionally narrow, but it is not based on a file allowlist. Supporting
+code, benchmark scripts, launchers, and other files may change when their behavioral
+effect is exclusive to the newly appended points named by the changelog. No changed
+benchmark path may execute for or alter an existing point. Every selected config and
+scenario must already exist, and every point generated at the base revision must
+remain present with the same recipe. The head may contain any additional generated
+recipes or points inside that scope, including new topology or other recipe dimensions;
+the sweep schedules the generated set difference. Additions must use the same non-null
+image and belong to an existing dashboard visual series. Each generated recipe carries
+a deterministic fingerprint so two distinct recipes at the same concurrency remain
+distinct database points without splitting the visual curve. Removing or modifying an
+existing point, or changing shared logic that can affect one, is rejected. Append-only
+entries cannot be mixed with regular entries or eval-selection modifiers in the same
+sweep. The matrix validator enforces the additive generated-matrix invariant; the human
+and AI reviewers must inspect the complete diff and verify behavioral isolation. The
+mechanical comparison renders each config revision with its own generator, validation
+code, and runner metadata. Launcher and benchmark-script changes still rely on
+complete-diff review because matrix equality alone cannot prove their runtime
+control-flow isolation.
+
+```yaml
+- config-keys:
+    - dsv4-fp4-b300-vllm-mtp
+  description:
+    - "Add TP8 at concurrency 12 and 16 to the existing curve"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/XXX
+  append-only: true
+```
+
+## AMD cluster: never leave root-owned files in runner workspaces
+
+Multi-node benchmarks on the AMD MI355X TW cluster submit Slurm jobs whose containers often run as **root**. If those containers write files (typically `benchmark_logs/logs/slurm_job-*`) into the GitHub Actions runner workspace and the job is **cancelled** before teardown runs, the root-owned directories are stranded. The runner user cannot delete them, so `actions/checkout` fails with:
+
+```
+Error: File was unable to be removed
+Error: EACCES: permission denied, rmdir '.../benchmark_logs/logs/slurm_job-<id>'
+```
+
+**This bricks every subsequent job on that runner** until someone with `sudo` on the shared `/it-share` storage manually removes the files. Because all AMD MI355X sweeps share the same runner pool, a single stranded root-owned directory blocks the entire queue for everyone.
+
+**Rules for benchmark scripts and Slurm containers:**
+
+1. **Never write as root into the runner workspace.** If your container must run as root, write outputs to a separate scratch directory outside `_work/` (e.g. `/tmp` or a dedicated staging path).
+2. **If root writes are unavoidable**, add a cleanup trap or teardown step that `chown`s or `rm`s all root-owned files under the workspace **before** the job exits, including on cancellation (`trap cleanup EXIT`).
+3. **Test your teardown path.** Cancel a running benchmark mid-flight and verify no root-owned files remain in the workspace.
+
+If you find a stranded root-owned file blocking runners, the recovery procedure is documented in [`.claude/commands/clean-amd-mi355-runner-root-files.md`](.claude/commands/clean-amd-mi355-runner-root-files.md): SSH into the hop host with `sudo`, scan the `_work` directories, and delete the offending files.
+
+## After merging
+
+**PR authors are responsible for ensuring that after merging, all GitHub Action jobs fully pass.** A lot of the time, failures are just flakes and simply re-running the failed jobs will fix it. [See GitHub's docs on re-running failed jobs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs#re-running-failed-jobs-in-a-workflow).

@@ -1,0 +1,1768 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for centralized API key / credential redaction."""
+
+from unittest.mock import MagicMock, patch
+
+import aiohttp
+import pytest
+from pytest import param
+
+from aiperf.common.models import AioHttpTraceData
+from aiperf.common.models.error_models import ErrorDetails
+from aiperf.common.models.model_endpoint_info import EndpointInfo
+from aiperf.common.redact import (
+    _SENSITIVE_HEADER_NAMES,
+    REDACTED_VALUE,
+    extract_sensitive_headers,
+    redact_cli_command,
+    redact_headers,
+    redact_string,
+    redact_url,
+)
+from aiperf.config.endpoint import EndpointConfig
+from aiperf.config.flags.cli_config import CLIConfig
+from aiperf.transports.aiohttp_trace import create_aiohttp_trace_config
+
+# =============================================================================
+# redact_headers
+# =============================================================================
+
+
+class TestRedactHeaders:
+    """Tests for redact_headers()."""
+
+    def test_none_returns_none(self):
+        assert redact_headers(None) is None
+
+    def test_empty_dict_returns_empty_dict(self):
+        assert redact_headers({}) == {}
+
+    def test_returns_new_dict(self):
+        """Redaction must not mutate the original headers dict."""
+        original = {"Authorization": "Bearer secret", "Accept": "text/plain"}
+        result = redact_headers(original)
+        assert original["Authorization"] == "Bearer secret"
+        assert result["Authorization"] == REDACTED_VALUE
+
+    @pytest.mark.parametrize(
+        "header_name",
+        sorted(_SENSITIVE_HEADER_NAMES),
+        ids=sorted(_SENSITIVE_HEADER_NAMES),
+    )
+    def test_sensitive_header_redacted(self, header_name):
+        """Every header name in _SENSITIVE_HEADER_NAMES is redacted."""
+        result = redact_headers({header_name: "some-secret-value"})
+        assert result[header_name] == REDACTED_VALUE
+
+    @pytest.mark.parametrize(
+        "header_name, value",
+        [
+            param("authorization", "Bearer token", id="authorization-lower"),
+            param("AUTHORIZATION", "Bearer token2", id="AUTHORIZATION-upper"),
+            param("x-api-key", "key1", id="x-api-key-lower"),
+            param("X-Api-Key", "key2", id="X-Api-Key-mixed"),
+        ],
+    )
+    def test_case_insensitive_matching(self, header_name, value):
+        result = redact_headers({header_name: value})
+        assert result[header_name] == REDACTED_VALUE
+
+    @pytest.mark.parametrize(
+        "header_name, value",
+        [
+            param("Content-Type", "application/json", id="content-type"),
+            param("Accept", "text/event-stream", id="accept"),
+            param("X-Request-ID", "abc-123", id="x-request-id"),
+            param("User-Agent", "aiperf/1.0", id="user-agent"),
+        ],
+    )
+    def test_non_sensitive_headers_unchanged(self, header_name, value):
+        result = redact_headers({header_name: value})
+        assert result[header_name] == value
+
+    def test_mixed_sensitive_and_non_sensitive(self):
+        headers = {
+            "Authorization": "Bearer sk-1234",
+            "X-API-Key": "nvapi-abc",
+            "Content-Type": "application/json",
+            "X-Request-ID": "req-001",
+            "User-Agent": "aiperf/1.0",
+        }
+        result = redact_headers(headers)
+        assert result["Authorization"] == REDACTED_VALUE
+        assert result["X-API-Key"] == REDACTED_VALUE
+        assert result["Content-Type"] == "application/json"
+        assert result["X-Request-ID"] == "req-001"
+        assert result["User-Agent"] == "aiperf/1.0"
+
+
+# =============================================================================
+# extract_sensitive_headers
+# =============================================================================
+
+
+class TestExtractSensitiveHeaders:
+    """Tests for extract_sensitive_headers().
+
+    Inverse of ``redact_headers``: returns only the entries the redactor
+    would strip. Used by the orchestrator to forward credential-bearing
+    headers via env var so the on-disk run_config.json stays redacted but
+    the subprocess can still authenticate to the upstream.
+    """
+
+    def test_none_returns_empty(self):
+        assert extract_sensitive_headers(None) == {}
+
+    def test_empty_dict_returns_empty(self):
+        assert extract_sensitive_headers({}) == {}
+
+    def test_only_non_sensitive_returns_empty(self):
+        assert extract_sensitive_headers({"Accept": "text/plain"}) == {}
+
+    def test_returns_sensitive_subset_preserving_case(self):
+        headers = {
+            "Authorization": "Api-Key abc123",
+            "X-API-Key": "nvapi-xyz",
+            "Content-Type": "application/json",
+            "X-Trace": "trace-1",
+        }
+        result = extract_sensitive_headers(headers)
+        assert result == {
+            "Authorization": "Api-Key abc123",
+            "X-API-Key": "nvapi-xyz",
+        }
+
+    def test_case_insensitive_match_preserves_original_case(self):
+        result = extract_sensitive_headers({"authorization": "Bearer tok"})
+        # Match is case-insensitive but the returned key is the caller's spelling
+        assert result == {"authorization": "Bearer tok"}
+
+    def test_redact_round_trip(self):
+        """extract + redact recovers the full header set.
+
+        Property: redact_headers(orig) | extract_sensitive_headers(orig)
+        is the same as orig (with redact's copy of non-sensitive entries).
+        """
+        orig = {
+            "Authorization": "Api-Key real-key",
+            "Content-Type": "application/json",
+        }
+        redacted = redact_headers(orig)
+        sensitive = extract_sensitive_headers(orig)
+        # The IPC round-trip: child loads `redacted`, parent forwards
+        # `sensitive`, child overlays.
+        reconstructed = {**redacted, **sensitive}
+        assert reconstructed == orig
+
+
+# =============================================================================
+# redact_string
+# =============================================================================
+
+_REDACT_STRING_CASES = [
+    # ── Bearer token: plain text ──
+    param(
+        "Authorization: Bearer sk-secret-key",
+        ["sk-secret-key"],
+        id="bearer-plain-text",
+    ),
+    param(
+        "authorization: bearer MY_TOKEN",
+        ["MY_TOKEN"],
+        id="bearer-case-insensitive",
+    ),
+    param(
+        "AUTHORIZATION: BEARER UPPER_TOKEN",
+        ["UPPER_TOKEN"],
+        id="bearer-all-upper",
+    ),
+    param(
+        "Authorization:Bearer no-space-after-colon",
+        ["no-space-after-colon"],
+        id="bearer-no-space-after-colon",
+    ),
+    # ── Bearer token: JSON-serialized ──
+    param(
+        '"Authorization":"Bearer sk-secret-json-key"',
+        ["sk-secret-json-key"],
+        id="bearer-json-serialized",
+    ),
+    param(
+        '"authorization":"bearer json-lower"',
+        ["json-lower"],
+        id="bearer-json-lowercase",
+    ),
+    # ── Bearer token: Python repr ──
+    param(
+        "'Authorization': 'Bearer sk-repr-key'",
+        ["sk-repr-key"],
+        id="bearer-python-repr",
+    ),
+    # ── Basic auth ──
+    param(
+        "Authorization: Basic dXNlcjpwYXNz",
+        ["dXNlcjpwYXNz"],
+        id="auth-basic-plain",
+    ),
+    param(
+        '"Authorization":"Basic dXNlcjpwYXNzSlNPTg=="',
+        ["dXNlcjpwYXNzSlNPTg=="],
+        id="auth-basic-json",
+    ),
+    param(
+        "authorization: basic lower-basic-token",
+        ["lower-basic-token"],
+        id="auth-basic-lowercase",
+    ),
+    # ── Proxy-Authorization: Bearer ──
+    param(
+        "Proxy-Authorization: Bearer proxy-secret-key",
+        ["proxy-secret-key"],
+        id="proxy-auth-bearer-plain",
+    ),
+    param(
+        '"Proxy-Authorization":"Bearer proxy-json-key"',
+        ["proxy-json-key"],
+        id="proxy-auth-bearer-json",
+    ),
+    param(
+        "'Proxy-Authorization': 'Bearer proxy-repr-key'",
+        ["proxy-repr-key"],
+        id="proxy-auth-bearer-repr",
+    ),
+    # ── Proxy-Authorization: Basic ──
+    param(
+        "proxy-authorization: basic dXNlcjpwYXNz",
+        ["dXNlcjpwYXNz"],
+        id="proxy-auth-basic-plain",
+    ),
+    param(
+        '"proxy-authorization":"basic proxy-basic-json"',
+        ["proxy-basic-json"],
+        id="proxy-auth-basic-json",
+    ),
+    # ── SigV4 Authorization (multi-token) ──
+    param(
+        "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855dfe1e8aa344f27c0d3bb",
+        [
+            "AKIAIOSFODNN7EXAMPLE",
+            "fe5f80f77d5fa3beca038a248ff027d0445342fe2855dfe1e8aa344f27c0d3bb",
+        ],
+        id="sigv4-plain-text",
+    ),
+    param(
+        '"Authorization":"AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abcdef1234567890"',
+        ["AKIAIOSFODNN7EXAMPLE", "abcdef1234567890"],
+        id="sigv4-json-serialized",
+    ),
+    param(
+        "'Authorization': 'AWS4-HMAC-SHA256 Credential=ASIAEXAMPLE/20260318/us-west-2/bedrock/aws4_request, Signature=deadbeef'",
+        ["ASIAEXAMPLE", "deadbeef"],
+        id="sigv4-python-repr",
+    ),
+    # ── Authorization: opaque token (no scheme keyword) ──
+    param(
+        "Authorization: nvapi-opaque-token-no-bearer",
+        ["nvapi-opaque-token-no-bearer"],
+        id="auth-opaque-no-scheme",
+    ),
+    param(
+        '"Authorization":"raw-opaque-token"',
+        ["raw-opaque-token"],
+        id="auth-opaque-json",
+    ),
+    # ── x-api-key: plain, JSON, repr ──
+    param(
+        "X-API-Key: nvapi-my-secret-key",
+        ["nvapi-my-secret-key"],
+        id="x-api-key-plain",
+    ),
+    param(
+        '"X-API-Key":"nvapi-json-secret"',
+        ["nvapi-json-secret"],
+        id="x-api-key-json",
+    ),
+    param(
+        "'x-api-key': 'repr-api-key'",
+        ["repr-api-key"],
+        id="x-api-key-repr",
+    ),
+    param(
+        "x-api-key: lowercase-key",
+        ["lowercase-key"],
+        id="x-api-key-lowercase",
+    ),
+    # ── api-key (Azure OpenAI): plain, JSON ──
+    param(
+        "api-key: azure-openai-key-123",
+        ["azure-openai-key-123"],
+        id="api-key-header-plain",
+    ),
+    param(
+        '"api-key":"azure-json-key"',
+        ["azure-json-key"],
+        id="api-key-header-json",
+    ),
+    param(
+        "API-Key: Mixed-Case-Azure-Key",
+        ["Mixed-Case-Azure-Key"],
+        id="api-key-header-mixed-case",
+    ),
+    # ── ocp-apim-subscription-key: plain, JSON ──
+    param(
+        "Ocp-Apim-Subscription-Key: sub-key-abc",
+        ["sub-key-abc"],
+        id="azure-apim-plain",
+    ),
+    param(
+        '"ocp-apim-subscription-key":"sub-json-key"',
+        ["sub-json-key"],
+        id="azure-apim-json",
+    ),
+    # ── x-goog-api-key: plain, JSON ──
+    param(
+        "X-Goog-Api-Key: AIzaSy-google-key",
+        ["AIzaSy-google-key"],
+        id="google-api-key-plain",
+    ),
+    param(
+        '"x-goog-api-key":"google-json-key"',
+        ["google-json-key"],
+        id="google-api-key-json",
+    ),
+    # ── x-functions-key: plain, JSON ──
+    param(
+        "X-Functions-Key: azure-func-key-xyz",
+        ["azure-func-key-xyz"],
+        id="azure-functions-key-plain",
+    ),
+    param(
+        '"x-functions-key":"func-json-key"',
+        ["func-json-key"],
+        id="azure-functions-key-json",
+    ),
+    # ── aeg-sas-key: plain, JSON ──
+    param(
+        "Aeg-Sas-Key: sas-token-abc123",
+        ["sas-token-abc123"],
+        id="azure-event-grid-plain",
+    ),
+    param(
+        '"aeg-sas-key":"sas-json-key"',
+        ["sas-json-key"],
+        id="azure-event-grid-json",
+    ),
+    # ── x-amz-security-token: plain, JSON ──
+    param(
+        "X-Amz-Security-Token: FwoGZX-aws-token",
+        ["FwoGZX-aws-token"],
+        id="aws-security-token-plain",
+    ),
+    param(
+        '"x-amz-security-token":"FwoGZX-aws-json-token"',
+        ["FwoGZX-aws-json-token"],
+        id="aws-security-token-json",
+    ),
+    # ── Query-string style key=value ──
+    param(
+        "api_key=supersecret&other=value",
+        ["supersecret"],
+        id="api-key-equals",
+    ),
+    param("api-key=my-secret", ["my-secret"], id="api-hyphen-key-equals"),
+    param("api key=space-key", ["space-key"], id="api-space-key-equals"),
+    param("token=abc123", ["abc123"], id="token-equals"),
+    param("secret=xyzzy", ["xyzzy"], id="secret-equals"),
+    param("TOKEN=UPPER_TOKEN", ["UPPER_TOKEN"], id="token-equals-upper"),
+    param("SECRET=UPPER_SECRET", ["UPPER_SECRET"], id="secret-equals-upper"),
+    param("Api_Key=mixed_case", ["mixed_case"], id="api-key-equals-mixed-case"),
+    # ── ZMQ trace messages ──
+    param(
+        'b\'{"endpoint_headers":{"Authorization":"Bearer sk-zmq-leak-123",'
+        '"Content-Type":"application/json"}}\'',
+        ["sk-zmq-leak-123"],
+        id="zmq-trace-bearer",
+    ),
+    param(
+        'b\'{"endpoint_headers":{"X-API-Key":"nvapi-zmq-key",'
+        '"Content-Type":"application/json"}}\'',
+        ["nvapi-zmq-key"],
+        id="zmq-trace-x-api-key",
+    ),
+    param(
+        'b\'{"endpoint_headers":{"Authorization":"AWS4-HMAC-SHA256 Credential=AKIA123/date/region/svc/aws4_request, Signature=abc123"}}\'',
+        ["AKIA123", "abc123"],
+        id="zmq-trace-sigv4",
+    ),
+    # ── Exception-style messages ──
+    param(
+        "ClientError: 401 Unauthorized, headers={'Authorization': 'Bearer sk-leaked'}",
+        ["sk-leaked"],
+        id="exception-with-bearer",
+    ),
+    param(
+        "ConnectionError: host=api.openai.com, api-key: sk-conn-err-key",
+        ["sk-conn-err-key"],
+        id="exception-with-api-key-header",
+    ),
+    param(
+        "aiohttp.ClientResponseError: 403, headers: {api-key: forbidden-key-123}",
+        ["forbidden-key-123"],
+        id="exception-with-api-key-in-braces",
+    ),
+    # ── Multiple patterns in one string ──
+    param(
+        "Authorization: Bearer tok123, api_key=secret456, X-API-Key: key789",
+        ["tok123", "secret456", "key789"],
+        id="multiple-patterns-mixed",
+    ),
+    param(
+        "Proxy-Authorization: Basic proxy-basic, api-key: azure-key-leak, secret=s3cr3t",
+        ["proxy-basic", "azure-key-leak", "s3cr3t"],
+        id="multiple-patterns-proxy-plus-headers",
+    ),
+    param(
+        '"Authorization":"Bearer j1","X-API-Key":"j2","api-key":"j3"',
+        ["j1", "j2", "j3"],
+        id="multiple-patterns-all-json",
+    ),
+]
+
+_REDACT_STRING_PRESERVE_CASES = [
+    param("Content-Type: application/json", id="content-type-unchanged"),
+    param("", id="empty-string"),
+    param("Normal log message with no secrets", id="plain-text"),
+    param("X-Request-ID: abc-123-def", id="x-request-id-unchanged"),
+    param("User-Agent: aiperf/1.0", id="user-agent-unchanged"),
+    param("Accept: text/event-stream", id="accept-unchanged"),
+    param("Cache-Control: no-cache", id="cache-control-unchanged"),
+    param(
+        "model=gpt-4&temperature=0.7&top_p=0.9",
+        id="query-params-no-sensitive-keys",
+    ),
+    param("X-Custom-Header: keep-me", id="custom-header-unchanged"),
+    param("200 OK", id="status-line"),
+    param(
+        '{"model":"gpt-4","temperature":0.7}',
+        id="json-payload-no-secrets",
+    ),
+]
+
+
+class TestRedactString:
+    """Tests for redact_string()."""
+
+    @pytest.mark.parametrize("input_str, secrets", _REDACT_STRING_CASES)
+    def test_secret_redacted(self, input_str, secrets):
+        result = redact_string(input_str)
+        for secret in secrets:
+            assert secret not in result, f"Secret {secret!r} leaked in: {result}"
+        assert REDACTED_VALUE in result
+
+    @pytest.mark.parametrize("input_str", _REDACT_STRING_PRESERVE_CASES)
+    def test_non_sensitive_unchanged(self, input_str):
+        assert redact_string(input_str) == input_str
+
+    def test_api_key_equals_preserves_other_params(self):
+        result = redact_string("api_key=supersecret&other=value")
+        assert "other=value" in result
+
+    def test_zmq_trace_preserves_non_sensitive_headers(self):
+        s = (
+            'b\'{"endpoint_headers":{"Authorization":"Bearer sk-zmq-leak-123",'
+            '"Content-Type":"application/json"}}\''
+        )
+        result = redact_string(s)
+        assert "application/json" in result
+
+    def test_sigv4_json_preserves_surrounding_fields(self):
+        s = (
+            '{"Authorization":"AWS4-HMAC-SHA256 Credential=AKIA/date/region/svc/req, '
+            'Signature=abc","Content-Type":"application/json","model":"gpt-4"}'
+        )
+        result = redact_string(s)
+        assert "AKIA" not in result
+        assert "abc" not in result
+        assert "application/json" in result
+        assert "gpt-4" in result
+
+    def test_proxy_auth_json_preserves_other_headers(self):
+        s = '"Proxy-Authorization":"Basic secret123","Accept":"text/plain"'
+        result = redact_string(s)
+        assert "secret123" not in result
+        assert "text/plain" in result
+
+    def test_multiple_sensitive_headers_in_json_object(self):
+        s = (
+            '{"X-API-Key":"nvapi-key1","api-key":"azure-key2",'
+            '"Authorization":"Bearer tok3","Content-Type":"application/json"}'
+        )
+        result = redact_string(s)
+        assert "nvapi-key1" not in result
+        assert "azure-key2" not in result
+        assert "tok3" not in result
+        assert "application/json" in result
+
+
+# =============================================================================
+# redact_cli_command
+# =============================================================================
+
+_MUST_REDACT_CASES = [
+    # --api-key forms
+    param("aiperf --api-key 'sk-12345'", ["sk-12345"], id="api-key-quoted"),
+    param("aiperf --api-key sk-12345", ["sk-12345"], id="api-key-unquoted"),
+    param("aiperf --api-key='sk-12345'", ["sk-12345"], id="api-key-equals-quoted"),
+    param("aiperf --api-key=sk-12345", ["sk-12345"], id="api-key-equals-unquoted"),
+    param(
+        "aiperf --api-key 'sk-proj-abc_123-XYZ.456'",
+        ["sk-proj-abc_123-XYZ.456"],
+        id="api-key-special-chars",
+    ),
+    # Quoted sensitive headers
+    param(
+        "aiperf --header 'Authorization:Bearer sk-abc'",
+        ["sk-abc"],
+        id="header-bearer-colon",
+    ),
+    param(
+        "aiperf --header 'Authorization: Bearer sk-abc'",
+        ["sk-abc"],
+        id="header-bearer-colon-space",
+    ),
+    param(
+        "aiperf --header 'Authorization Bearer sk-abc'",
+        ["sk-abc"],
+        id="header-bearer-space",
+    ),
+    param(
+        "aiperf --header 'Authorization:Basic dXNlcjpwYXNz'",
+        ["dXNlcjpwYXNz"],
+        id="header-basic-auth",
+    ),
+    param(
+        "aiperf --header 'X-API-Key:nvapi-secret'",
+        ["nvapi-secret"],
+        id="header-x-api-key",
+    ),
+    param(
+        "aiperf --header 'X-API-Key: nvapi-secret'",
+        ["nvapi-secret"],
+        id="header-x-api-key-space",
+    ),
+    param(
+        "aiperf --header 'API-Key:my-secret'", ["my-secret"], id="header-api-key-no-x"
+    ),
+    param(
+        "aiperf --header 'Proxy-Authorization:Bearer proxy-tok'",
+        ["proxy-tok"],
+        id="header-proxy-auth",
+    ),
+    param("aiperf -H 'Authorization:Bearer sk-abc'", ["sk-abc"], id="H-shorthand"),
+    # Case variations
+    param(
+        "aiperf --header 'AUTHORIZATION:Bearer sk-abc'",
+        ["sk-abc"],
+        id="header-uppercase",
+    ),
+    param(
+        "aiperf --header 'authorization:Bearer sk-abc'",
+        ["sk-abc"],
+        id="header-lowercase",
+    ),
+    param(
+        "aiperf --header 'x-api-key:nvapi-secret'",
+        ["nvapi-secret"],
+        id="header-x-api-key-lower",
+    ),
+    param(
+        "aiperf --header 'api-key:my-secret'", ["my-secret"], id="header-api-key-lower"
+    ),
+    param(
+        "aiperf --header 'proxy-authorization:Bearer tok'",
+        ["tok"],
+        id="header-proxy-auth-lower",
+    ),
+    # Unquoted forms
+    param(
+        "aiperf --header Authorization:Bearer sk-abc",
+        ["sk-abc"],
+        id="header-unquoted-bearer",
+    ),
+    param(
+        "aiperf -H X-API-Key:nvapi-secret", ["nvapi-secret"], id="H-unquoted-x-api-key"
+    ),
+    param(
+        "aiperf --header API-Key:my-secret", ["my-secret"], id="header-unquoted-api-key"
+    ),
+    param(
+        "aiperf --header Proxy-Authorization:Bearer tok",
+        ["tok"],
+        id="header-unquoted-proxy-auth",
+    ),
+    param(
+        "aiperf --header Authorization:Bearer sk-abc --url http://host",
+        ["sk-abc"],
+        id="header-unquoted-bearer-trailing-flag",
+    ),
+    # Edge cases
+    param(
+        "aiperf --header 'Authorization:Bearer sk-abc=123=456'",
+        ["sk-abc=123=456"],
+        id="header-bearer-with-equals",
+    ),
+    param(
+        "aiperf --header 'Authorization:Bearer http://token-server/abc'",
+        ["http://token-server/abc"],
+        id="header-bearer-url-like-value",
+    ),
+    param(
+        "aiperf --api-key 'sk-1' --header 'Authorization:Bearer sk-2' -H 'X-API-Key:nvapi-3'",
+        ["sk-1", "sk-2", "nvapi-3"],
+        id="multiple-secrets",
+    ),
+    # Double-quoted headers: auth schemes
+    param(
+        'aiperf --header "Authorization:Bearer sk-abc"',
+        ["sk-abc"],
+        id="dq-bearer",
+    ),
+    param(
+        'aiperf --header "Authorization: Bearer sk-with-space"',
+        ["sk-with-space"],
+        id="dq-bearer-space",
+    ),
+    param(
+        'aiperf --header "Authorization:Basic dXNlcjpwYXNz"',
+        ["dXNlcjpwYXNz"],
+        id="dq-basic",
+    ),
+    param(
+        'aiperf --header "Proxy-Authorization:Bearer proxy-tok"',
+        ["proxy-tok"],
+        id="dq-proxy-auth-bearer",
+    ),
+    param(
+        'aiperf --header "proxy-authorization:basic proxy-basic-tok"',
+        ["proxy-basic-tok"],
+        id="dq-proxy-auth-basic-lower",
+    ),
+    # Double-quoted headers: -H shorthand
+    param(
+        'aiperf -H "Authorization:Bearer sk-H-dq"',
+        ["sk-H-dq"],
+        id="dq-H-bearer",
+    ),
+    param(
+        'aiperf -H "X-API-Key:nvapi-secret"',
+        ["nvapi-secret"],
+        id="dq-H-x-api-key",
+    ),
+    # Double-quoted headers: all cloud provider headers
+    param(
+        'aiperf --header "API-Key:azure-dq-key"',
+        ["azure-dq-key"],
+        id="dq-api-key",
+    ),
+    param(
+        'aiperf --header "Ocp-Apim-Subscription-Key:azure-dq-sub"',
+        ["azure-dq-sub"],
+        id="dq-azure-apim",
+    ),
+    param(
+        'aiperf --header "X-Goog-Api-Key:google-dq-key"',
+        ["google-dq-key"],
+        id="dq-google-api-key",
+    ),
+    param(
+        'aiperf --header "X-Functions-Key:azure-dq-func"',
+        ["azure-dq-func"],
+        id="dq-azure-functions",
+    ),
+    param(
+        'aiperf --header "Aeg-Sas-Key:azure-dq-sas"',
+        ["azure-dq-sas"],
+        id="dq-azure-event-grid",
+    ),
+    param(
+        'aiperf --header "X-Amz-Security-Token:aws-dq-token"',
+        ["aws-dq-token"],
+        id="dq-aws-security-token",
+    ),
+    # Double-quoted headers: case variations
+    param(
+        'aiperf --header "authorization:bearer sk-dq-lower"',
+        ["sk-dq-lower"],
+        id="dq-bearer-all-lower",
+    ),
+    param(
+        'aiperf --header "AUTHORIZATION:BEARER SK-DQ-UPPER"',
+        ["SK-DQ-UPPER"],
+        id="dq-bearer-all-upper",
+    ),
+    param(
+        'aiperf --header "x-api-key:dq-lower-x-api"',
+        ["dq-lower-x-api"],
+        id="dq-x-api-key-lower",
+    ),
+    # Mixed single and double quotes in one command
+    param(
+        """aiperf --header 'Authorization:Bearer sq-tok' --header "X-API-Key:dq-key" """,
+        ["sq-tok", "dq-key"],
+        id="mixed-single-double-quotes",
+    ),
+    param(
+        """aiperf --api-key 'sk-1' -H "Authorization:Bearer dq-tok2" --header 'X-API-Key:sq-key3'""",
+        ["sk-1", "dq-tok2", "sq-key3"],
+        id="api-key-plus-mixed-quotes",
+    ),
+    # Cloud provider headers (single-quoted)
+    param(
+        "aiperf --header 'Ocp-Apim-Subscription-Key:abc-sub-key-123'",
+        ["abc-sub-key-123"],
+        id="header-azure-apim-subscription-key",
+    ),
+    param(
+        "aiperf --header 'X-Goog-Api-Key:AIzaSy-google-key'",
+        ["AIzaSy-google-key"],
+        id="header-google-api-key",
+    ),
+    param(
+        "aiperf --header 'X-Functions-Key:azure-func-key-xyz'",
+        ["azure-func-key-xyz"],
+        id="header-azure-functions-key",
+    ),
+    param(
+        "aiperf --header 'Aeg-Sas-Key:sas-token-abc123'",
+        ["sas-token-abc123"],
+        id="header-azure-event-grid-sas",
+    ),
+    param(
+        "aiperf --header 'X-Amz-Security-Token:FwoGZX-aws-temp-token'",
+        ["FwoGZX-aws-temp-token"],
+        id="header-aws-security-token",
+    ),
+    param(
+        "aiperf --header 'ocp-apim-subscription-key:lowercase-key'",
+        ["lowercase-key"],
+        id="header-azure-apim-lowercase",
+    ),
+]
+
+
+class TestRedactCliCommandSecrets:
+    """Verify secrets are redacted from CLI command strings."""
+
+    @pytest.mark.parametrize("cmd, secrets", _MUST_REDACT_CASES)
+    def test_secret_redacted(self, cmd, secrets):
+        result = redact_cli_command(cmd)
+        for secret in secrets:
+            assert secret not in result, f"Secret {secret!r} leaked in: {result}"
+        assert REDACTED_VALUE in result
+
+
+_MUST_KEEP_CASES = [
+    # Normal flags and values
+    param("aiperf --model 'gpt-4'", ["gpt-4"], id="model-name"),
+    param("aiperf --url 'http://localhost:8000'", ["http://localhost:8000"], id="url"),
+    param("aiperf --endpoint-type 'chat'", ["chat"], id="endpoint-type"),
+    param("aiperf --concurrency 10", ["10"], id="concurrency"),
+    param("aiperf --streaming", ["--streaming"], id="boolean-flag"),
+    # Non-sensitive headers
+    param(
+        "aiperf --header 'Content-Type:application/json'",
+        ["Content-Type:application/json"],
+        id="header-content-type",
+    ),
+    param(
+        "aiperf --header 'Accept:text/event-stream'",
+        ["Accept:text/event-stream"],
+        id="header-accept",
+    ),
+    param(
+        "aiperf --header 'X-Custom-Tracking:trace-abc-123'",
+        ["X-Custom-Tracking:trace-abc-123"],
+        id="header-custom",
+    ),
+    param(
+        "aiperf --header 'X-Request-ID:req-001'",
+        ["X-Request-ID:req-001"],
+        id="header-request-id",
+    ),
+    param(
+        "aiperf -H 'User-Agent:aiperf/1.0'",
+        ["User-Agent:aiperf/1.0"],
+        id="header-user-agent",
+    ),
+    param(
+        "aiperf --header 'Cache-Control:no-cache'",
+        ["Cache-Control:no-cache"],
+        id="header-cache-control",
+    ),
+    # Headers that look similar but aren't in _SENSITIVE_HEADER_NAMES
+    param(
+        "aiperf --header 'X-Authorization:Bearer tok'",
+        ["Bearer tok"],
+        id="x-authorization-not-sensitive",
+    ),
+    param(
+        "aiperf --header 'Auth-Token:my-token'",
+        ["my-token"],
+        id="auth-token-not-sensitive",
+    ),
+    param(
+        "aiperf --header 'X-API-Version:2024-01'",
+        ["X-API-Version:2024-01"],
+        id="x-api-version-not-sensitive",
+    ),
+    # Double-quoted non-sensitive headers preserved
+    param(
+        'aiperf --header "Content-Type:application/json"',
+        ["Content-Type:application/json"],
+        id="dq-header-content-type",
+    ),
+    param(
+        'aiperf --header "Accept:text/event-stream"',
+        ["Accept:text/event-stream"],
+        id="dq-header-accept",
+    ),
+    param(
+        'aiperf -H "X-Custom:my-value"',
+        ["X-Custom:my-value"],
+        id="dq-header-custom",
+    ),
+    param(
+        'aiperf --header "X-Request-ID:req-dq-001"',
+        ["X-Request-ID:req-dq-001"],
+        id="dq-header-request-id",
+    ),
+    # Double-quoted look-alikes preserved
+    param(
+        'aiperf --header "X-Authorization:Bearer tok"',
+        ["Bearer tok"],
+        id="dq-x-authorization-not-sensitive",
+    ),
+    param(
+        'aiperf --header "X-API-Version:2024-01"',
+        ["X-API-Version:2024-01"],
+        id="dq-x-api-version-not-sensitive",
+    ),
+    # Partial matches in non-header contexts
+    param(
+        "aiperf --model 'authorization-test-model'",
+        ["authorization-test-model"],
+        id="model-with-auth-in-name",
+    ),
+    param(
+        "aiperf --url 'http://host/api-key-manager/v1'",
+        ["api-key-manager"],
+        id="url-with-api-key-in-path",
+    ),
+    param(
+        "aiperf --custom-endpoint '/v1/authorization/check'",
+        ["/v1/authorization/check"],
+        id="endpoint-with-auth",
+    ),
+    param(
+        "aiperf --extra-inputs 'token_count:100'",
+        ["token_count:100"],
+        id="extra-input-with-token-word",
+    ),
+]
+
+
+class TestRedactCliCommandPreservesNonSecrets:
+    """Verify non-secret values are NOT redacted (no over-redaction)."""
+
+    @pytest.mark.parametrize("cmd, must_keep", _MUST_KEEP_CASES)
+    def test_value_preserved(self, cmd, must_keep):
+        result = redact_cli_command(cmd)
+        for value in must_keep:
+            assert value in result, f"Value {value!r} was over-redacted in: {result}"
+
+
+_INTERLEAVED_CASES = [
+    param(
+        "aiperf --header 'Authorization:Bearer sk-abc' --header 'X-Custom:keep-me'",
+        ["sk-abc"],
+        ["X-Custom:keep-me"],
+        id="sensitive-then-non-sensitive",
+    ),
+    param(
+        "aiperf --header 'X-Custom:keep-me' --header 'Authorization:Bearer sk-abc'",
+        ["sk-abc"],
+        ["X-Custom:keep-me"],
+        id="non-sensitive-then-sensitive",
+    ),
+    param(
+        "aiperf -H 'Authorization:Bearer sk-abc' -H 'X-API-Key:nvapi-secret'",
+        ["sk-abc", "nvapi-secret"],
+        [],
+        id="two-sensitive-back-to-back",
+    ),
+    param(
+        "aiperf --header 'Accept:text/json' --header 'Authorization:Bearer sk-abc' --header 'X-Trace:trace-123'",
+        ["sk-abc"],
+        ["text/json", "trace-123"],
+        id="sensitive-sandwiched",
+    ),
+    param(
+        "aiperf --api-key 'sk-secret' --header 'X-Custom:keep-me'",
+        ["sk-secret"],
+        ["X-Custom:keep-me"],
+        id="api-key-then-non-sensitive-header",
+    ),
+    param(
+        "aiperf --header 'X-Custom:keep-me' --api-key 'sk-secret'",
+        ["sk-secret"],
+        ["X-Custom:keep-me"],
+        id="non-sensitive-header-then-api-key",
+    ),
+    param(
+        "aiperf --header 'Content-Type:application/json' --api-key 'sk-secret' --header 'Accept:text/plain'",
+        ["sk-secret"],
+        ["application/json", "text/plain"],
+        id="api-key-between-non-sensitive",
+    ),
+    param(
+        "aiperf --api-key 'sk-secret' --header 'Authorization:Bearer sk-other' --header 'X-Trace:trace-456'",
+        ["sk-secret", "sk-other"],
+        ["trace-456"],
+        id="api-key-and-auth-then-non-sensitive",
+    ),
+    param(
+        "aiperf -H 'Authorization:Bearer t1' -H 'X-API-Key:t2' -H 'API-Key:t3' -H 'Proxy-Authorization:Bearer t4'",
+        ["t1", "t2", "t3", "t4"],
+        [],
+        id="all-four-sensitive-header-types",
+    ),
+    param(
+        "aiperf -H 'Accept:k1' -H 'Authorization:Bearer s1' -H 'X-Trace:k2' -H 'X-API-Key:s2' -H 'Content-Type:k3'",
+        ["s1", "s2"],
+        ["k1", "k2", "k3"],
+        id="interleaved-sensitive-and-non-sensitive",
+    ),
+    param(
+        "aiperf --api-key 'sk-secret' --extra-inputs 'temperature:0.7' --extra-inputs 'top_p:0.9'",
+        ["sk-secret"],
+        ["temperature:0.7", "top_p:0.9"],
+        id="api-key-adjacent-to-extra-inputs",
+    ),
+    param(
+        "aiperf --api-key 'sk-secret' --model 'gpt-4' --header 'Authorization:Bearer sk-other'",
+        ["sk-secret", "sk-other"],
+        ["gpt-4"],
+        id="model-sandwiched-between-secrets",
+    ),
+    param(
+        (
+            "aiperf 'profile' --model 'gpt-4' --url 'http://localhost:8000' "
+            "--api-key 'sk-real-key' --header 'Authorization:Bearer sk-real-key' "
+            "--header 'X-Custom:my-trace' --extra-inputs 'temperature:0.7' "
+            "--endpoint-type 'chat' --streaming --concurrency 5"
+        ),
+        ["sk-real-key"],
+        [
+            "gpt-4",
+            "http://localhost:8000",
+            "my-trace",
+            "temperature:0.7",
+            "chat",
+            "--streaming",
+        ],
+        id="full-realistic-command",
+    ),
+    # Double-quoted interleaved
+    param(
+        'aiperf --header "Authorization:Bearer dq-s1" --header "X-Custom:dq-k1"',
+        ["dq-s1"],
+        ["dq-k1"],
+        id="dq-sensitive-then-non-sensitive",
+    ),
+    param(
+        'aiperf --header "X-Custom:dq-k1" --header "Authorization:Bearer dq-s1"',
+        ["dq-s1"],
+        ["dq-k1"],
+        id="dq-non-sensitive-then-sensitive",
+    ),
+    param(
+        'aiperf -H "Authorization:Bearer dq1" -H "X-API-Key:dq2" -H "API-Key:dq3"',
+        ["dq1", "dq2", "dq3"],
+        [],
+        id="dq-three-sensitive-back-to-back",
+    ),
+    param(
+        'aiperf --header "Accept:dq-keep" --header "Authorization:Bearer dq-hide" --header "X-Trace:dq-keep2"',
+        ["dq-hide"],
+        ["dq-keep", "dq-keep2"],
+        id="dq-sensitive-sandwiched",
+    ),
+    # Mixed single-quoted and double-quoted interleaved
+    param(
+        """aiperf --header 'Authorization:Bearer sq-tok' --header "X-Custom:dq-keep" --header "X-API-Key:dq-secret" """,
+        ["sq-tok", "dq-secret"],
+        ["dq-keep"],
+        id="mixed-sq-dq-interleaved",
+    ),
+    param(
+        """aiperf -H "Authorization:Bearer dq1" -H 'X-Custom:sq-keep' -H "X-Goog-Api-Key:dq2" -H 'Content-Type:sq-ct'""",
+        ["dq1", "dq2"],
+        ["sq-keep", "sq-ct"],
+        id="mixed-alternating-sq-dq",
+    ),
+    # All sensitive header types in double-quoted form
+    param(
+        (
+            'aiperf -H "Authorization:Bearer dq-t1" '
+            '-H "X-API-Key:dq-t2" '
+            '-H "API-Key:dq-t3" '
+            '-H "Proxy-Authorization:Bearer dq-t4" '
+            '-H "Ocp-Apim-Subscription-Key:dq-t5" '
+            '-H "X-Goog-Api-Key:dq-t6" '
+            '-H "X-Functions-Key:dq-t7" '
+            '-H "Aeg-Sas-Key:dq-t8" '
+            '-H "X-Amz-Security-Token:dq-t9"'
+        ),
+        [
+            "dq-t1",
+            "dq-t2",
+            "dq-t3",
+            "dq-t4",
+            "dq-t5",
+            "dq-t6",
+            "dq-t7",
+            "dq-t8",
+            "dq-t9",
+        ],
+        [],
+        id="dq-all-nine-sensitive-header-types",
+    ),
+    # Full realistic command with double-quoted headers
+    param(
+        (
+            'aiperf profile --model "gpt-4" --url "http://localhost:8000" '
+            '--api-key "sk-dq-real" --header "Authorization:Bearer sk-dq-real" '
+            '--header "X-Custom:my-trace" --extra-inputs "temperature:0.7" '
+            "--endpoint-type chat --streaming --concurrency 5"
+        ),
+        ["sk-dq-real"],
+        [
+            "gpt-4",
+            "http://localhost:8000",
+            "my-trace",
+            "temperature:0.7",
+        ],
+        id="full-realistic-double-quoted",
+    ),
+]
+
+
+class TestRedactCliCommandInterleaved:
+    """Verify correct behavior when sensitive and non-sensitive args are adjacent."""
+
+    @pytest.mark.parametrize("cmd, secrets, must_keep", _INTERLEAVED_CASES)
+    def test_interleaved(self, cmd, secrets, must_keep):
+        result = redact_cli_command(cmd)
+        for secret in secrets:
+            assert secret not in result, f"Secret {secret!r} leaked in: {result}"
+        for value in must_keep:
+            assert value in result, f"Value {value!r} over-redacted in: {result}"
+
+
+class TestRedactCliCommandUrlFlags:
+    """URL-typed flags (--url, -u, --otel-url, --mlflow-tracking-uri) must
+    have userinfo stripped from their values. The rest of the URL and the
+    surrounding quotes/flag must be preserved.
+    """
+
+    @pytest.mark.parametrize(
+        "cmd, secrets, must_keep",
+        [
+            param(
+                "aiperf profile --url http://u1:s1@h1/v1 http://u2:s2@h2/v1",
+                ["u1:s1", "u2:s2"],
+                ["--url", "@h1/v1", "@h2/v1"],
+                id="multi-url-consume-multiple-unquoted",
+            ),
+            param(
+                "aiperf profile --url 'http://a:x@h1' 'http://b:y@h2' 'http://c:z@h3'",
+                ["a:x", "b:y", "c:z"],
+                ["@h1", "@h2", "@h3"],
+                id="multi-url-consume-multiple-quoted",
+            ),
+            # Regression: EndpointConfig.urls auto-prefixes `http://` for
+            # scheme-less values, so users commonly write `--url user:pass@host`
+            # without a scheme. The scheme-prefixed safety net misses these;
+            # the bare-userinfo safety net catches them.
+            param(
+                "aiperf profile --url user1:pass1@host1 user2:pass2@host2",
+                ["user1:pass1", "user2:pass2"],
+                ["--url", "@host1", "@host2"],
+                id="multi-url-scheme-less-bare-userinfo",
+            ),
+            param(
+                "aiperf profile --url 'user1:pass1@host1' 'user2:pass2@host2'",
+                ["user1:pass1", "user2:pass2"],
+                ["--url", "@host1", "@host2"],
+                id="multi-url-scheme-less-bare-userinfo-quoted",
+            ),
+        ],
+    )  # fmt: skip
+    def test_multi_url_consume_multiple_redacts_all(
+        self, cmd: str, secrets: list[str], must_keep: list[str]
+    ):
+        """Regression: --url / -u accept multiple values via consume_multiple=True.
+        The first value is caught by _URL_FLAG_PATTERN; later values are caught
+        by the stray-URL safety net. All userinfo must be stripped.
+        """
+        result = redact_cli_command(cmd)
+        for secret in secrets:
+            assert secret not in result, f"Secret {secret!r} leaked in: {result}"
+        for keep in must_keep:
+            assert keep in result, f"Value {keep!r} over-redacted in: {result}"
+
+    @pytest.mark.parametrize(
+        "cmd, secret, must_keep",
+        [
+            param(
+                "aiperf profile --url 'http://user:pass@host:8000/v1'",
+                "user:pass",
+                ["--url", "@host:8000/v1"],
+                id="single-quoted-url",
+            ),
+            param(
+                'aiperf profile --url "http://user:pass@host:8000/v1"',
+                "user:pass",
+                ["--url", "@host:8000/v1"],
+                id="double-quoted-url",
+            ),
+            param(
+                "aiperf profile -u http://tok@collector:4317/path",
+                "tok",
+                ["-u", "@collector:4317/path"],
+                id="short-flag-unquoted",
+            ),
+            param(
+                "aiperf profile --otel-url 'https://secret:key@otel:4318'",
+                "secret:key",
+                ["--otel-url", "@otel:4318"],
+                id="otel-url",
+            ),
+            param(
+                "aiperf profile --mlflow-tracking-uri 'http://mlflow:pw@tracker:5000'",
+                "mlflow:pw",
+                ["--mlflow-tracking-uri", "@tracker:5000"],
+                id="mlflow-tracking-uri",
+            ),
+        ],
+    )  # fmt: skip
+    def test_userinfo_redacted_in_url_flag_value(
+        self, cmd: str, secret: str, must_keep: list[str]
+    ):
+        result = redact_cli_command(cmd)
+        assert secret not in result, f"Secret {secret!r} leaked in: {result}"
+        assert REDACTED_VALUE in result
+        for keep in must_keep:
+            assert keep in result, f"Value {keep!r} over-redacted in: {result}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            param("aiperf profile --url 'http://localhost:8000'", id="plain-url"),
+            param(
+                "aiperf profile --url 'http://host/users@example.com'",
+                id="at-in-path-no-userinfo",
+            ),
+            param(
+                "aiperf plot --paths /tmp/run@latest --output /out",
+                id="at-in-unrelated-arg",
+            ),
+            param(
+                "aiperf profile --url http://localhost:8000 --model foo@bar",
+                id="stray-safety-net-does-not-touch-non-url-arg",
+            ),
+        ],
+    )  # fmt: skip
+    def test_urls_without_userinfo_unchanged(self, cmd: str):
+        """Non-userinfo URLs and unrelated args with `@` must pass through."""
+        assert redact_cli_command(cmd) == cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # --mlflow-tag: key:value pairs with `@` in value are legitimate MLflow tag
+            # metadata (owner/contact/email). They must NOT be eaten by the stray
+            # bare-userinfo safety net, because the safety net is only meaningful
+            # for 2nd+ values of `--url`/`-u` (consume_multiple=True).
+            param(
+                "aiperf profile --mlflow-tag owner:alice@acme.com",
+                id="mlflow-tag-email-value",
+            ),
+            param(
+                "aiperf profile --mlflow-tag contact:a@b",
+                id="mlflow-tag-short-email",
+            ),
+            param(
+                "aiperf profile --mlflow-tag region:us-east-1 owner:alice@acme.com",
+                id="mlflow-tag-multi-positional",
+            ),
+            # --header with a non-credential header whose value legitimately
+            # contains `@` (email, tracecontext, forwarded IPs). These headers
+            # are NOT in _SENSITIVE_HEADER_NAMES so the CLI secret patterns
+            # don't fire; the stray bare-userinfo pattern used to over-redact
+            # them. Must pass through unchanged.
+            param(
+                "aiperf profile --header X-User-Email:alice@acme.com",
+                id="header-email",
+            ),
+            param(
+                'aiperf profile --header "X-User-Email:alice@acme.com"',
+                id="header-email-double-quoted",
+            ),
+            param(
+                "aiperf profile --header 'X-User-Email:alice@acme.com'",
+                id="header-email-single-quoted",
+            ),
+            param(
+                "aiperf profile --header X-Trace-Parent:00-abc-def-01@span",
+                id="header-trace-parent",
+            ),
+            param(
+                "aiperf profile --header X-Forwarded-For:10.0.0.1@network",
+                id="header-forwarded",
+            ),
+            # --otel-resource-attributes uses `key=value` (not `:`) so not
+            # affected by the bare-userinfo pattern at all, but belt-and-suspenders.
+            param(
+                "aiperf profile --otel-url localhost:4318 "
+                "--otel-resource-attributes owner=alice@acme.com",
+                id="otel-resource-attributes-equals-email",
+            ),
+            # Typical combined CLI: URL has credentials (redacted), non-URL flags
+            # carry `@` values that must survive.
+            param(
+                "aiperf profile --model foo --url http://api.openai.com "
+                "--header X-User-Email:alice@acme.com "
+                "--mlflow-tag owner:alice@acme.com "
+                "--mlflow-tracking-uri http://mlflow.local:5000",
+                id="combined-cli-non-credential-at-preserved",
+            ),
+        ],
+    )  # fmt: skip
+    def test_non_url_flag_values_with_at_preserved(self, cmd: str):
+        """Regression for over-redaction of ``key:value@...`` on non-URL flags.
+
+        The stray bare-userinfo safety net catches 2nd+ values of
+        ``--url``/``-u`` (consume_multiple=True scheme-less leak). A global
+        sweep of that pattern used to eat legitimate ``key:value@...`` tokens
+        on ``--header`` / ``--mlflow-tag`` / ``--otel-resource-attributes``,
+        mangling email addresses, W3C trace contexts, forwarded IPs, and
+        MLflow contact tags. Scoped to the ``--url``/``-u`` consumption
+        window, so every one of these commands round-trips unchanged.
+        """
+        # For combined-cli, the URL credentials (if any) would be redacted but
+        # the non-URL `@` tokens must survive. Assert each preserved token.
+        result = redact_cli_command(cmd)
+        for must_keep in (
+            "alice@acme.com",
+            "a@b",
+            "01@span",
+            "10.0.0.1@network",
+        ):
+            if must_keep in cmd:
+                assert must_keep in result, (
+                    f"Value {must_keep!r} over-redacted in: {result}"
+                )
+
+
+# =============================================================================
+# EndpointConfig api_key protection
+# =============================================================================
+
+
+class TestEndpointConfigApiKeyProtected:
+    """Verify api_key is redacted on the v2 EndpointConfig JSON dump.
+
+    v2 only redacts in JSON mode (``model_dump_json``); dict-mode dumps return
+    the raw key so the runtime can still build authenticated requests.
+    """
+
+    def _make(self, **kwargs):
+        from aiperf.config.endpoint import EndpointConfig as V2EndpointConfig
+
+        return V2EndpointConfig(urls=["http://localhost:8000"], **kwargs)
+
+    def test_api_key_redacted_in_json(self):
+        config = self._make(api_key="sk-secret")
+        json_str = config.model_dump_json()
+        assert "sk-secret" not in json_str
+        assert REDACTED_VALUE in json_str
+
+    def test_api_key_none_not_redacted_in_json(self):
+        config = self._make()
+        json_str = config.model_dump_json()
+        assert REDACTED_VALUE not in json_str
+
+    def test_api_key_still_accessible_as_attribute(self):
+        config = self._make(api_key="sk-secret")
+        assert config.api_key == "sk-secret"
+
+    def test_api_key_present_in_dict_dump(self):
+        """Dict-mode dump preserves raw api_key for runtime use; JSON is the redacted artifact path."""
+        config = self._make(api_key="sk-secret")
+        assert config.model_dump()["api_key"] == "sk-secret"
+
+
+# =============================================================================
+# EndpointConfig.urls userinfo protection
+# =============================================================================
+
+
+class TestEndpointConfigUrlsProtected:
+    """Verify endpoint.urls strip userinfo during serialization.
+
+    ``profile_export_aiperf.json`` is written to disk and uploaded as an MLflow
+    run artifact. Without the ``_redact_urls`` field serializer, a URL like
+    ``http://alice:s3cret@host:8000`` leaks verbatim into both the on-disk
+    export and the artifact tree.
+    """
+
+    def test_userinfo_stripped_in_model_dump(self):
+        config = EndpointConfig(urls=["http://alice:s3cret@host:8000/v1/chat"])
+        dumped_urls = config.model_dump()["urls"]
+        assert "s3cret" not in dumped_urls[0]
+        assert "alice" not in dumped_urls[0]
+        # Host/port/path survive.
+        assert "host:8000/v1/chat" in dumped_urls[0]
+        assert REDACTED_VALUE in dumped_urls[0]
+
+    def test_userinfo_stripped_in_json(self):
+        config = EndpointConfig(urls=["http://alice:s3cret@host:8000"])
+        json_str = config.model_dump_json()
+        assert "s3cret" not in json_str
+        assert "alice:s3cret" not in json_str
+
+    def test_multiple_urls_each_redacted(self):
+        config = EndpointConfig(
+            urls=[
+                "http://a:x@h1",
+                "http://b:y@h2",
+                "http://h3-no-userinfo",
+            ],
+        )
+        dumped_urls = config.model_dump()["urls"]
+        assert "a:x" not in dumped_urls[0]
+        assert "b:y" not in dumped_urls[1]
+        # URLs without userinfo pass through unchanged.
+        assert dumped_urls[2] == "http://h3-no-userinfo"
+
+    def test_urls_without_userinfo_unchanged(self):
+        config = EndpointConfig(urls=["http://host:8000/v1"])
+        assert config.model_dump()["urls"] == ["http://host:8000/v1"]
+
+    def test_urls_preserved_with_include_secrets_context(self):
+        """Runtime callers that need the real URL can opt out of redaction."""
+        config = EndpointConfig(urls=["http://alice:s3cret@host:8000"])
+        dumped = config.model_dump(context={"include_secrets": True})
+        assert "alice:s3cret" in dumped["urls"][0]
+
+    def test_urls_still_accessible_on_instance(self):
+        """Runtime code reads ``config.urls`` directly; redaction is only on serialization."""
+        config = EndpointConfig(urls=["http://alice:s3cret@host:8000"])
+        assert "alice:s3cret@host:8000" in config.urls[0]
+
+
+# =============================================================================
+# EndpointInfo api_key protection
+# =============================================================================
+
+
+class TestEndpointInfoApiKeyExcluded:
+    """Verify api_key is excluded from serialization on EndpointInfo."""
+
+    def test_api_key_excluded_from_model_dump(self):
+        info = EndpointInfo(api_key="nvapi-secret")
+        assert "api_key" not in info.model_dump()
+
+    def test_api_key_excluded_from_json(self):
+        info = EndpointInfo(api_key="nvapi-secret")
+        assert "nvapi-secret" not in info.model_dump_json()
+
+    def test_api_key_not_in_repr(self):
+        info = EndpointInfo(api_key="nvapi-secret")
+        assert "nvapi-secret" not in repr(info)
+
+    def test_api_key_still_accessible(self):
+        info = EndpointInfo(api_key="nvapi-secret")
+        assert info.api_key == "nvapi-secret"
+
+
+# =============================================================================
+# InputConfig headers redaction
+# =============================================================================
+
+
+class TestInputConfigHeadersRedaction:
+    """Headers stored on InputConfig are passed through dict-mode dumps as-is.
+
+    Header redaction lives in the JSON artifact path and the
+    ``redact_headers`` utility — not on Pydantic dict-mode serialization.
+    """
+
+    @pytest.mark.parametrize(
+        "headers, expected",
+        [
+            param(
+                [("X-Custom-Header", "my-value"), ("Accept", "text/event-stream")],
+                [("X-Custom-Header", "my-value"), ("Accept", "text/event-stream")],
+                id="non-sensitive-unchanged",
+            ),
+        ],
+    )
+    def test_headers_unchanged_in_dump(self, headers, expected):
+        config = CLIConfig(headers=headers)
+        assert config.model_dump()["headers"] == expected
+
+    def test_headers_still_accessible_as_attribute(self):
+        config = CLIConfig(headers=[("Authorization", "Bearer sk-secret")])
+        assert config.headers == [("Authorization", "Bearer sk-secret")]
+
+
+# =============================================================================
+# CLI command redaction (via CLIConfig)
+# =============================================================================
+
+
+class TestCliCommandRedaction:
+    """Verify --api-key and sensitive --header values are redacted in cli_command.
+
+    The synthesized command is stored on ``BenchmarkRun.cli_command``
+    (auto-populated via ``build_cli_command`` from sys.argv) and surfaced into
+    ``RunInfo.cli_command`` in ``profile_export_aiperf.json``.
+    """
+
+    def _build_cli_command(self, argv: list[str]) -> str:
+        from aiperf.common.redact import build_cli_command
+
+        with patch("sys.argv", argv):
+            return build_cli_command()
+
+    def test_api_key_redacted_in_cli_command(self):
+        cmd = self._build_cli_command(
+            [
+                "aiperf",
+                "profile",
+                "--model",
+                "gpt2",
+                "--api-key",
+                "sk-12345",
+                "--url",
+                "http://localhost:8000",
+            ]
+        )
+        assert "sk-12345" not in cmd
+        assert REDACTED_VALUE in cmd
+
+    @pytest.mark.parametrize(
+        "flag, header_value, secret",
+        [
+            param(
+                "--header",
+                "Authorization:Bearer sk-abc123",
+                "sk-abc123",
+                id="header-authorization",
+            ),
+            param("-H", "X-API-Key:nvapi-secret", "nvapi-secret", id="H-x-api-key"),
+            param(
+                "--header",
+                "Ocp-Apim-Subscription-Key:azure-sub-key",
+                "azure-sub-key",
+                id="header-azure-apim",
+            ),
+        ],
+    )
+    def test_sensitive_header_redacted_in_cli_command(self, flag, header_value, secret):
+        # _build_cli_command must produce an already-redacted canonical command
+        # string — callers (e.g. JSON exporter) should not need to re-apply
+        # redact_cli_command on top.
+        cmd = self._build_cli_command(
+            ["aiperf", "profile", "--model", "gpt2", flag, header_value]
+        )
+        assert secret not in cmd
+        assert REDACTED_VALUE in cmd
+
+    def test_authorization_bearer_argv_redacted_in_cli_command(self):
+        """Regression: argv with `--header Authorization:Bearer X` must be
+        redacted by _build_cli_command alone, no second pass required."""
+        cmd = self._build_cli_command(
+            [
+                "aiperf",
+                "profile",
+                "--model",
+                "gpt2",
+                "--header",
+                "Authorization:Bearer token123",
+            ]
+        )
+        assert "token123" not in cmd
+        assert REDACTED_VALUE in cmd
+
+    def test_non_sensitive_args_preserved_in_cli_command(self):
+        cmd = self._build_cli_command(
+            ["aiperf", "profile", "--model", "gpt2", "--url", "http://localhost:8000"]
+        )
+        assert "http://localhost:8000" in cmd
+        assert "gpt2" in cmd
+
+    @pytest.mark.parametrize(
+        "flag, value",
+        [
+            param("--input-tokens-mean", "1024", id="input-tokens-mean"),
+            param("--input-tokens-stddev", "0", id="input-tokens-stddev"),
+            param("--output-tokens-mean", "128", id="output-tokens-mean"),
+            param("--output-tokens-stddev", "32", id="output-tokens-stddev"),
+            param(
+                "--synthetic-input-tokens-mean", "1024", id="synthetic-input-tokens-mean",
+            ),
+            param(
+                "--synthetic-input-tokens-stddev",
+                "0",
+                id="synthetic-input-tokens-stddev",
+            ),
+        ],
+    )  # fmt: skip
+    def test_token_count_flags_preserve_value_in_cli_command(self, flag, value):
+        """Regression: flag names containing 'tokens' (plural — LLM token
+        counts) must not be redacted just because they share a substring with
+        auth-token flags. Reported via real-run output where every
+        --*-tokens-* flag value came back as '<redacted>'."""
+        cmd = self._build_cli_command(
+            ["aiperf", "profile", "--model", "gpt2", flag, value]
+        )
+        assert value in cmd, f"{flag} value {value!r} should not be redacted"
+        assert REDACTED_VALUE not in cmd
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            param("--api-token", id="api-token"),
+            param("--api_token", id="api_token-underscore"),
+            param("--auth-token", id="auth-token"),
+            param("--access-token", id="access-token"),
+            param("--bearer-token", id="bearer-token"),
+            param("--id-token", id="id-token"),
+            param("--refresh-token", id="refresh-token"),
+        ],
+    )  # fmt: skip
+    def test_auth_token_compound_flags_redacted_in_cli_command(self, flag):
+        """Auth-token flag variants must still be redacted after tightening
+        the sensitive-token list away from the bare-'token' substring match."""
+        secret = "nv-secret-AUTH-TOKEN-9876543210"
+        cmd = self._build_cli_command(
+            ["aiperf", "profile", "--model", "gpt2", flag, secret]
+        )
+        assert secret not in cmd
+        assert REDACTED_VALUE in cmd
+
+
+# =============================================================================
+# ErrorDetails safe repr
+# =============================================================================
+
+
+class TestErrorDetailsSafeRepr:
+    """Verify ErrorDetails._safe_repr uses centralized redaction."""
+
+    @pytest.mark.parametrize(
+        "message, secret",
+        [
+            param(
+                "Failed with Authorization: Bearer sk-12345",
+                "sk-12345",
+                id="bearer-token",
+            ),
+            param(
+                "Connection failed: api_key=supersecret",
+                "supersecret",
+                id="api-key-equals",
+            ),
+            param(
+                "Headers: X-API-Key: my-key-value",
+                "my-key-value",
+                id="x-api-key-header",
+            ),
+            param(
+                "401 Unauthorized: Authorization: Basic dXNlcjpwYXNz",
+                "dXNlcjpwYXNz",
+                id="basic-auth-in-error",
+            ),
+            param(
+                "Proxy-Authorization: Bearer proxy-err-tok",
+                "proxy-err-tok",
+                id="proxy-auth-in-error",
+            ),
+            param(
+                "SigV4 failure: Authorization: AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/date/region/svc/req, Signature=deadbeef",
+                "AKIAEXAMPLE",
+                id="sigv4-credential-in-error",
+            ),
+            param(
+                "Azure error: api-key: azure-err-key",
+                "azure-err-key",
+                id="api-key-header-in-error",
+            ),
+            param(
+                "Google error: X-Goog-Api-Key: goog-err-key",
+                "goog-err-key",
+                id="google-api-key-in-error",
+            ),
+            param(
+                "AWS error: X-Amz-Security-Token: FwoGZX-err-token",
+                "FwoGZX-err-token",
+                id="aws-token-in-error",
+            ),
+            param(
+                "secret=leaked-in-traceback&debug=true",
+                "leaked-in-traceback",
+                id="secret-query-param-in-error",
+            ),
+        ],
+    )
+    def test_secret_redacted_in_exception(self, message, secret):
+        exc = Exception(message)
+        assert secret not in ErrorDetails.from_exception(exc).message
+
+
+# =============================================================================
+# aiohttp trace header redaction
+# =============================================================================
+
+
+class TestAioHttpTraceRedaction:
+    """Verify that aiohttp trace captures redacted headers."""
+
+    @pytest.mark.asyncio
+    async def test_request_headers_redacted_in_trace(self):
+        trace_data = AioHttpTraceData()
+        trace_config = create_aiohttp_trace_config(trace_data)
+
+        callbacks = trace_config.on_request_headers_sent
+        assert len(callbacks) == 1
+
+        session = MagicMock(spec=aiohttp.ClientSession)
+        params = MagicMock(spec=aiohttp.TraceRequestHeadersSentParams)
+        params.headers = {
+            "Authorization": "Bearer sk-secret-token-123",
+            "Content-Type": "application/json",
+            "X-API-Key": "nvapi-my-key",
+        }
+
+        await callbacks[0](session, MagicMock(), params)
+
+        assert trace_data.request_headers is not None
+        assert trace_data.request_headers["Authorization"] == REDACTED_VALUE
+        assert trace_data.request_headers["X-API-Key"] == REDACTED_VALUE
+        assert trace_data.request_headers["Content-Type"] == "application/json"
+
+
+# =============================================================================
+# redact_url
+# =============================================================================
+
+
+class TestRedactUrl:
+    """Tests for redact_url() — strip userinfo from URLs without false positives."""
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            param(
+                "https://user:pass@host.com/api",
+                f"https://{REDACTED_VALUE}@host.com/api",
+                id="scheme-with-userinfo",
+            ),
+            param(
+                "http://user:pass@host.com:8080",
+                f"http://{REDACTED_VALUE}@host.com:8080",
+                id="scheme-userinfo-with-port",
+            ),
+            param(
+                "https://user:pass@[::1]:8080/path",
+                f"https://{REDACTED_VALUE}@[::1]:8080/path",
+                id="scheme-userinfo-ipv6",
+            ),
+            param(
+                "user:pass@host:8080",
+                f"{REDACTED_VALUE}@host:8080",
+                id="bare-userinfo",
+            ),
+        ],
+    )  # fmt: skip
+    def test_userinfo_is_redacted(self, url: str, expected: str):
+        assert redact_url(url) == expected
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            param("http://localhost:5000", id="no-userinfo"),
+            param(
+                "https://host.com/api/users@example.com",
+                id="at-in-path",
+            ),
+            param(
+                "https://host.com/?email=a@b.com",
+                id="at-in-query",
+            ),
+            param(
+                "https://host.com/path?q=a@b.com&x=y",
+                id="at-in-query-with-extra-params",
+            ),
+            param("https://host.com/path#frag@tag", id="at-in-fragment"),
+            param("", id="empty-string"),
+        ],
+    )  # fmt: skip
+    def test_url_without_userinfo_is_unchanged(self, url: str):
+        """@ appearing in path, query, or fragment must not trigger redaction."""
+        assert redact_url(url) == url
+
+    @pytest.mark.parametrize(
+        "uri,expected",
+        [
+            param(
+                "postgresql://user:secret@db:5432/mlflow",
+                f"postgresql://{REDACTED_VALUE}@db:5432/mlflow",
+                id="postgresql-with-userinfo",
+            ),
+            param(
+                "mysql+pymysql://u:p@host/mlflow",
+                f"mysql+pymysql://{REDACTED_VALUE}@host/mlflow",
+                id="mysql-with-dialect-plus-userinfo",
+            ),
+            param(
+                "mssql://u:p@sql.internal:1433/mlflow",
+                f"mssql://{REDACTED_VALUE}@sql.internal:1433/mlflow",
+                id="mssql-with-userinfo",
+            ),
+            param(
+                "file:///tmp/mlruns",
+                "file:///tmp/mlruns",
+                id="file-no-userinfo",
+            ),
+            param(
+                "sqlite:///tmp/mlflow.db",
+                "sqlite:///tmp/mlflow.db",
+                id="sqlite-no-userinfo",
+            ),
+        ],
+    )  # fmt: skip
+    def test_redacts_userinfo_for_non_http_schemes(self, uri: str, expected: str):
+        """MLflow tracking-uri commonly uses DB URIs — userinfo must be stripped
+        regardless of scheme.
+        """
+        assert redact_url(uri) == expected
+
+
+# =============================================================================
+# Log filter redaction
+# =============================================================================

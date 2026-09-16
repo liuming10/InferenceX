@@ -1,0 +1,309 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+from pytest import param
+from rich.console import Console
+
+from aiperf.common.constants import NANOS_PER_MILLIS
+from aiperf.common.enums import MetricConsoleGroup
+from aiperf.common.models import MetricResult, ProfileResults
+from aiperf.config.flags.cli_config import CLIConfig
+from aiperf.exporters.console_metrics_exporter import ConsoleMetricsExporter
+from aiperf.exporters.experimental_metrics_console_exporter import (
+    ConsoleExperimentalMetricsExporter,
+)
+from aiperf.exporters.http_trace_console_exporter import HttpTraceConsoleExporter
+from aiperf.exporters.internal_metrics_console_exporter import (
+    ConsoleInternalMetricsExporter,
+)
+from aiperf.metrics.display_units import to_display_unit
+from aiperf.metrics.metric_registry import MetricRegistry
+from aiperf.metrics.types.benchmark_duration_metric import BenchmarkDurationMetric
+from aiperf.metrics.types.credit_drop_latency_metric import CreditDropLatencyMetric
+from aiperf.metrics.types.error_request_count import ErrorRequestCountMetric
+from aiperf.metrics.types.inter_token_latency_metric import InterTokenLatencyMetric
+from aiperf.metrics.types.output_token_count import OutputTokenCountMetric
+from aiperf.metrics.types.request_latency_metric import RequestLatencyMetric
+from aiperf.metrics.types.ttft_metric import TTFTMetric
+from aiperf.plugin.enums import EndpointType
+from tests.unit.exporters.conftest import make_exporter_config
+
+
+@pytest.fixture
+def mock_endpoint_config():
+    return CLIConfig(
+        endpoint_type=EndpointType.CHAT,
+        streaming=True,
+        model_names=["test-model"],
+    )
+
+
+@pytest.fixture
+def sample_records():
+    return [
+        MetricResult(
+            tag="time_to_first_token",
+            header="Time to First Token",
+            unit="ms",
+            avg=120.5,
+            min=110.0,
+            max=130.0,
+            p99=128.0,
+            p90=125.0,
+            p75=122.0,
+        ),
+        MetricResult(
+            tag="request_latency",
+            header="Request Latency",
+            unit="ms",
+            avg=15.3,
+            min=12.1,
+            max=21.4,
+            p99=20.5,
+            p90=18.7,
+            p75=16.2,
+        ),
+        MetricResult(
+            tag="inter_token_latency",
+            header="Inter Token Latency",
+            unit="ms",
+            avg=3.7,
+            min=2.9,
+            max=5.1,
+            p99=4.9,
+            p90=4.5,
+            p75=4.0,
+        ),
+        MetricResult(
+            tag="request_throughput",
+            header="Request Throughput",
+            unit="requests/sec",
+            avg=95.0,
+        ),
+    ]
+
+
+@pytest.fixture
+def mock_exporter_config(sample_records, mock_endpoint_config):
+    input_config = CLIConfig(
+        **mock_endpoint_config.model_dump(exclude_unset=True),
+    )
+    return make_exporter_config(
+        results=ProfileResults(
+            records=sample_records,
+            start_ns=0,
+            end_ns=0,
+            completed=0,
+        ),
+        cli_config=input_config,
+        telemetry_results=None,
+    )
+
+
+class TestConsoleExporter:
+    @pytest.mark.asyncio
+    async def test_export_prints_expected_table(self, mock_exporter_config, capsys):
+        exporter = ConsoleMetricsExporter(mock_exporter_config)
+        await exporter.export(Console(width=115))
+        output = capsys.readouterr().out
+        assert "NVIDIA AIPerf | LLM Metrics" in output
+        assert "Time to First Token (ms)" in output or "Time to First Token" in output
+        assert "Request Latency (ms)" in output or "Request Latency" in output
+        assert "Inter Token Latency (ms)" in output or "Inter Token Latency" in output
+        assert "Request Throughput" in output
+        assert "requests/sec" in output
+
+    @pytest.mark.asyncio
+    async def test_export_prints_cache_hint_when_usage_without_cache(
+        self, mock_endpoint_config, capsys
+    ):
+        # Usage reported (total prompt tokens) but no cache-read total → hint.
+        config = make_exporter_config(
+            results=ProfileResults(
+                records=[
+                    MetricResult(
+                        tag="request_latency",
+                        header="Request Latency",
+                        unit="ns",
+                        avg=1.0,
+                    ),
+                    MetricResult(
+                        tag="total_usage_prompt_tokens",
+                        header="Total Usage Prompt Tokens",
+                        unit="tokens",
+                        sum=58250,
+                        avg=1165.0,
+                        count=50,
+                    ),
+                ],
+                start_ns=0,
+                end_ns=0,
+                completed=0,
+            ),
+            cli_config=mock_endpoint_config,
+            telemetry_results=None,
+        )
+        await ConsoleMetricsExporter(config).export(Console(width=115))
+        assert "--enable-prompt-tokens-details" in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_export_omits_cache_hint_when_cache_reported(
+        self, mock_endpoint_config, capsys
+    ):
+        config = make_exporter_config(
+            results=ProfileResults(
+                records=[
+                    MetricResult(
+                        tag="request_latency",
+                        header="Request Latency",
+                        unit="ns",
+                        avg=1.0,
+                    ),
+                    MetricResult(
+                        tag="total_usage_prompt_tokens",
+                        header="h",
+                        unit="tokens",
+                        sum=58250,
+                        count=50,
+                    ),
+                    MetricResult(
+                        tag="total_usage_prompt_cache_read_tokens",
+                        header="h",
+                        unit="tokens",
+                        sum=50176,
+                        count=50,
+                    ),
+                ],
+                start_ns=0,
+                end_ns=0,
+                completed=0,
+            ),
+            cli_config=mock_endpoint_config,
+            telemetry_results=None,
+        )
+        await ConsoleMetricsExporter(config).export(Console(width=115))
+        assert "--enable-prompt-tokens-details" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "metric_tag, should_show",
+        [
+            # ERROR_ONLY flags - always hidden
+            (ErrorRequestCountMetric.tag, False),  # ERROR_ONLY flag
+            # console_group=NONE - hidden
+            (BenchmarkDurationMetric.tag, False),  # console_group=NONE
+            (OutputTokenCountMetric.tag, False),  # console_group=NONE
+            (CreditDropLatencyMetric.tag, False),  # INTERNAL flag
+            # INTERNAL flags - hidden
+            (CreditDropLatencyMetric.tag, False),  # INTERNAL flag
+            # Normal metrics - shown
+            (InterTokenLatencyMetric.tag, True),  # Normal metric
+            (RequestLatencyMetric.tag, True),  # Normal metric
+            (TTFTMetric.tag, True),  # Normal metric
+        ],
+    )  # fmt: skip
+    def test_should_show_metrics_based_on_flags(
+        self,
+        mock_endpoint_config: CLIConfig,
+        metric_tag,
+        should_show,
+    ):
+        """Test that metrics are shown/hidden based on their flags"""
+        config = make_exporter_config(
+            results=ProfileResults(
+                records=[],
+                start_ns=0,
+                end_ns=0,
+                completed=0,
+            ),
+            cli_config=mock_endpoint_config,
+            telemetry_results=None,
+        )
+        exporter = ConsoleMetricsExporter(config)
+
+        record = MetricResult(
+            tag=metric_tag,
+            header="Test Metric",
+            unit="ms",
+            avg=1.0,
+        )
+        assert exporter._should_show(record) is should_show
+
+    def test_format_row_formats_values_correctly(self, mock_exporter_config):
+        exporter = ConsoleMetricsExporter(mock_exporter_config)
+        # Request latency metric expects values in nanoseconds (native unit)
+        # but displays in milliseconds.
+        record = MetricResult(
+            tag="request_latency",
+            header="Request Latency",
+            unit="ns",
+            avg=10.123 * NANOS_PER_MILLIS,
+            min=None,
+            max=20.0 * NANOS_PER_MILLIS,
+            p99=None,
+            p90=15.5 * NANOS_PER_MILLIS,
+            p50=12.3 * NANOS_PER_MILLIS,
+        )
+        record = to_display_unit(record, MetricRegistry)
+        row = exporter._format_row(record)
+        # This asserts that the display is unit converted correctly
+        assert row[0] == "Request Latency (ms)"
+        assert row[1] == "10.12"
+        assert row[2] == "[dim]N/A[/dim]"
+        assert row[3] == "20.00"
+        assert row[4] == "[dim]N/A[/dim]"
+        assert row[5] == "15.50"
+        assert row[6] == "12.30"
+
+    def test_get_title_returns_expected_string(self, mock_exporter_config):
+        exporter = ConsoleMetricsExporter(mock_exporter_config)
+        assert exporter._get_title() == "NVIDIA AIPerf | LLM Metrics"
+
+    @pytest.mark.parametrize(
+        "exporter_class",
+        [
+            param(ConsoleInternalMetricsExporter, id="internal"),
+            param(ConsoleExperimentalMetricsExporter, id="experimental"),
+            param(HttpTraceConsoleExporter, id="http_trace"),
+        ],
+    )  # fmt: skip
+    @pytest.mark.parametrize(
+        "console_group",
+        [
+            param(None, id="no_inline_group"),
+            param(MetricConsoleGroup.DEFAULT, id="inline_default_group"),
+        ],
+    )  # fmt: skip
+    def test_should_show_unregistered_tag_hidden_by_require_flags_gated_exporter(
+        self, exporter_class, console_group
+    ):
+        """A require_flags-gated exporter must reject an unregistered
+        (analyzer-injected) tag: it has no metric class and therefore no flags,
+        so it can never satisfy the require_flags requirement. The inline
+        console_group override must not rescue it."""
+        # exporter_config=None skips the dev-mode / show_trace_timing gate.
+        exporter = exporter_class(exporter_config=None)
+        record = MetricResult(
+            tag="analyzer_injected_sweep_metric",
+            header="h",
+            unit="tokens/sec",
+            avg=1.0,
+            console_group=console_group,
+        )
+        assert exporter._should_show(record) is False
+
+    def test_should_show_unregistered_tag_shown_by_default_exporter_with_matching_group(
+        self, mock_exporter_config
+    ):
+        """The default (non-flag-gated) exporter still shows an unregistered
+        analyzer-injected tag when its inline console_group matches
+        console_groups — the PR's intended new behavior."""
+        exporter = ConsoleMetricsExporter(mock_exporter_config)
+        record = MetricResult(
+            tag="analyzer_injected_sweep_metric",
+            header="h",
+            unit="tokens/sec",
+            avg=1.0,
+            console_group=MetricConsoleGroup.EFFECTIVE,
+        )
+        assert exporter._should_show(record) is True

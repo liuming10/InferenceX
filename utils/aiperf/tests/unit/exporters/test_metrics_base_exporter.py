@@ -1,0 +1,314 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for MetricsBaseExporter base class."""
+
+import tempfile
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from aiperf.common.models import MetricResult
+from aiperf.config.flags.cli_config import CLIConfig
+from aiperf.exporters.exporter_config import ExporterConfig
+from aiperf.exporters.metrics_base_exporter import MetricsBaseExporter
+from aiperf.plugin.enums import EndpointType
+from tests.unit.exporters.conftest import make_exporter_config
+
+
+class ConcreteExporter(MetricsBaseExporter):
+    """Concrete implementation for testing MetricsBaseExporter."""
+
+    def __init__(self, exporter_config: ExporterConfig, **kwargs):
+        super().__init__(exporter_config, **kwargs)
+        self._file_path = self._output_directory / "test_export.txt"
+
+    def _generate_content(self) -> str:
+        return "test content"
+
+
+@pytest.fixture
+def mock_cfg():
+    """Create a mock CLIConfig for testing."""
+    return CLIConfig(
+        model_names=["test-model"],
+        endpoint_type=EndpointType.CHAT,
+        custom_endpoint="/custom_endpoint",
+    )
+
+
+@pytest.fixture
+def mock_results():
+    """Create mock results with basic metrics."""
+
+    class MockResults:
+        def __init__(self):
+            self.records = [
+                MetricResult(
+                    tag="time_to_first_token",
+                    header="Time to First Token",
+                    unit="ms",
+                    avg=45.2,
+                )
+            ]
+            self.start_ns = None
+            self.end_ns = None
+            self.has_results = True
+            self.was_cancelled = False
+            self.error_summary = []
+
+    return MockResults()
+
+
+@pytest.fixture
+def exporter_config(mock_results, mock_cfg):
+    """Create ExporterConfig for testing."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_cfg.artifact_directory = Path(temp_dir)
+        yield make_exporter_config(
+            results=mock_results,
+            cli_config=mock_cfg,
+            telemetry_results=None,
+        )
+
+
+class TestMetricsBaseExporterInitialization:
+    """Tests for MetricsBaseExporter initialization."""
+
+    def test_base_exporter_initialization(self, mock_results, mock_cfg):
+        """Verify all instance variables are set correctly from ExporterConfig."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mock_cfg.artifact_directory = Path(temp_dir)
+            config = make_exporter_config(
+                results=mock_results,
+                cli_config=mock_cfg,
+                telemetry_results=None,
+            )
+
+            exporter = ConcreteExporter(config)
+
+            assert exporter._results is mock_results
+            assert exporter._telemetry_results is None
+            assert exporter._cfg is config.cfg
+            assert exporter._output_directory == Path(temp_dir)
+
+
+class TestMetricsBaseExporterPrepareMetrics:
+    """Tests for _prepare_metrics() method.
+
+    _prepare_metrics() keys metrics by tag AND drops INTERNAL/EXPERIMENTAL
+    metrics (the accumulator summary engine does not pre-filter, so the file
+    exporters must -- mirroring the console exporter's exclude_flags). Tags not
+    in MetricRegistry (dynamically injected) are kept.
+    """
+
+    def test_prepare_metrics_returns_dict_keyed_by_tag(self, exporter_config):
+        """Verify metrics are returned as a dict keyed by tag."""
+        exporter = ConcreteExporter(exporter_config)
+
+        metric = MetricResult(
+            tag="time_to_first_token",
+            header="Time to First Token",
+            unit="ms",
+            avg=45.2,
+        )
+
+        result = exporter._prepare_metrics([metric])
+
+        assert "time_to_first_token" in result
+        assert result["time_to_first_token"] is metric
+
+    def test_prepare_metrics_multiple_metrics(self, exporter_config):
+        """Verify multiple metrics are all included."""
+        exporter = ConcreteExporter(exporter_config)
+
+        metrics = [
+            MetricResult(tag="metric_a", header="A", unit="ms", avg=1.0),
+            MetricResult(tag="metric_b", header="B", unit="ms", avg=2.0),
+        ]
+
+        result = exporter._prepare_metrics(metrics)
+
+        assert len(result) == 2
+        assert "metric_a" in result
+        assert "metric_b" in result
+
+    def test_prepare_metrics_handles_empty_input(self, exporter_config):
+        """Verify it returns empty dict without errors for empty input."""
+        exporter = ConcreteExporter(exporter_config)
+
+        result = exporter._prepare_metrics([])
+
+        assert result == {}
+
+    def test_prepare_metrics_drops_internal_and_experimental(self, exporter_config):
+        """INTERNAL/EXPERIMENTAL metrics must be excluded from file exports
+        (default dev flags off); public + unknown-tag metrics are kept.
+
+        Regression guard for the accumulator-summary path: reverting the
+        _prepare_metrics filter would leak internal metrics (e.g.
+        min_request_timestamp, credit_drop_latency) into profile_export_aiperf
+        .json/.csv -- which origin/main excluded.
+        """
+        exporter = ConcreteExporter(exporter_config)
+        metrics = [
+            MetricResult(tag="time_to_first_token", header="TTFT", unit="ms", avg=1.0),
+            MetricResult(tag="min_request_timestamp", header="min", unit="ns", avg=2.0),
+            MetricResult(tag="credit_drop_latency", header="cdl", unit="ms", avg=3.0),
+            MetricResult(tag="stream_setup_latency", header="ssl", unit="ms", avg=4.0),
+            MetricResult(tag="injected_custom_tag", header="inj", unit="ms", avg=5.0),
+        ]
+
+        result = exporter._prepare_metrics(metrics)
+
+        assert "time_to_first_token" in result  # public -> kept
+        assert "injected_custom_tag" in result  # not in registry -> kept
+        assert "min_request_timestamp" not in result  # INTERNAL -> dropped
+        assert "credit_drop_latency" not in result  # INTERNAL -> dropped
+        assert "stream_setup_latency" not in result  # EXPERIMENTAL -> dropped
+
+    def test_prepare_metrics_keeps_internal_when_dev_flag_set(
+        self, exporter_config, monkeypatch
+    ):
+        """With SHOW_INTERNAL_METRICS enabled, INTERNAL metrics are retained."""
+        from aiperf.common.environment import Environment
+
+        monkeypatch.setattr(Environment.DEV, "SHOW_INTERNAL_METRICS", True)
+        exporter = ConcreteExporter(exporter_config)
+        result = exporter._prepare_metrics(
+            [MetricResult(tag="min_request_timestamp", header="m", unit="ns", avg=1.0)]
+        )
+        assert "min_request_timestamp" in result
+
+
+class TestMetricsBaseExporterExport:
+    """Tests for export() method."""
+
+    @pytest.mark.asyncio
+    async def test_export_creates_output_directory(self, mock_results, mock_cfg):
+        """Verify directory is created if it doesn't exist."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "nested" / "output"
+            mock_cfg.artifact_directory = output_dir
+
+            config = make_exporter_config(
+                results=mock_results,
+                cli_config=mock_cfg,
+                telemetry_results=None,
+            )
+
+            exporter = ConcreteExporter(config)
+
+            assert not output_dir.exists()
+
+            await exporter.export()
+
+            assert output_dir.exists()
+            assert output_dir.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_export_calls_generate_content(self, mock_results, mock_cfg):
+        """Verify _generate_content() is called during export."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mock_cfg.artifact_directory = Path(temp_dir)
+            config = make_exporter_config(
+                results=mock_results,
+                cli_config=mock_cfg,
+                telemetry_results=None,
+            )
+
+            exporter = ConcreteExporter(config)
+
+            with patch.object(
+                exporter, "_generate_content", return_value="mocked content"
+            ) as mock_generate:
+                await exporter.export()
+
+                mock_generate.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_export_writes_content_to_file(self, mock_results, mock_cfg):
+        """Verify file contains returned content."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mock_cfg.artifact_directory = Path(temp_dir)
+            config = make_exporter_config(
+                results=mock_results,
+                cli_config=mock_cfg,
+                telemetry_results=None,
+            )
+
+            exporter = ConcreteExporter(config)
+
+            test_content = "This is test content\nWith multiple lines"
+
+            with patch.object(exporter, "_generate_content", return_value=test_content):
+                await exporter.export()
+
+                with open(exporter._file_path) as f:
+                    actual_content = f.read()
+
+                assert actual_content == test_content
+
+    @pytest.mark.asyncio
+    async def test_export_handles_write_errors(self, mock_results, mock_cfg):
+        """Verify error is logged and exception is re-raised on write failure."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mock_cfg.artifact_directory = Path(temp_dir)
+            config = make_exporter_config(
+                results=mock_results,
+                cli_config=mock_cfg,
+                telemetry_results=None,
+            )
+
+            exporter = ConcreteExporter(config)
+
+            # Create a dict to track if error was called
+            called = {"err": None}
+
+            def _err(msg):
+                called["err"] = msg
+
+            with patch.object(exporter, "error", _err):
+                import aiperf.exporters.metrics_base_exporter as mbe
+
+                # Create a mock that raises when used as async context manager
+                mock_file = MagicMock()
+                mock_file.__aenter__ = AsyncMock(side_effect=OSError("disk full"))
+                mock_file.__aexit__ = AsyncMock(return_value=False)
+
+                with patch.object(mbe.aiofiles, "open", return_value=mock_file):
+                    with pytest.raises(OSError, match="disk full"):
+                        await exporter.export()
+
+                    assert called["err"] is not None
+                    assert "Failed to export" in called["err"]
+
+    @pytest.mark.asyncio
+    async def test_export_logs_debug_message(self, mock_results, mock_cfg):
+        """Verify debug message is logged with file path."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mock_cfg.artifact_directory = Path(temp_dir)
+            config = make_exporter_config(
+                results=mock_results,
+                cli_config=mock_cfg,
+                telemetry_results=None,
+            )
+
+            exporter = ConcreteExporter(config)
+
+            debug_messages = []
+
+            def _debug(msg_func):
+                if callable(msg_func):
+                    debug_messages.append(msg_func())
+                else:
+                    debug_messages.append(msg_func)
+
+            with patch.object(exporter, "debug", _debug):
+                await exporter.export()
+
+                # Check that a debug message containing the file path was logged
+                assert any(str(exporter._file_path) in msg for msg in debug_messages), (
+                    f"Expected file path in debug messages: {debug_messages}"
+                )

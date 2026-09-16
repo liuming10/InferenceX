@@ -1,0 +1,684 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for execution strategies."""
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+from pytest import param
+
+from aiperf.common.models.export_models import JsonMetricResult
+from aiperf.config import BenchmarkConfig
+from aiperf.orchestrator.models import RunResult
+from aiperf.orchestrator.strategies import (
+    AdaptiveStrategy,
+    FixedTrialsStrategy,
+    SweepMode,
+    _sanitize_label,
+)
+
+_MINIMAL_CONFIG_KWARGS = {
+    "models": ["test-model"],
+    "endpoint": {"urls": ["http://localhost:8000/v1/chat/completions"]},
+    "datasets": [
+        {
+            "name": "default",
+            "type": "synthetic",
+            "entries": 100,
+            "prompts": {"isl": 128, "osl": 64},
+        }
+    ],
+    "phases": [
+        {
+            "name": "warmup",
+            "type": "concurrency",
+            "requests": 10,
+            "concurrency": 1,
+            "exclude_from_results": True,
+        },
+        {"name": "profiling", "type": "concurrency", "requests": 100, "concurrency": 1},
+    ],
+}
+
+
+def _make_config(**overrides) -> BenchmarkConfig:
+    # random_seed lives on AIPerfConfig envelope post-Task 8; drop legacy kwarg
+    overrides.pop("random_seed", None)
+    kwargs = {**_MINIMAL_CONFIG_KWARGS, **overrides}
+    return BenchmarkConfig(**kwargs)
+
+
+def _has_warmup_phase(config: BenchmarkConfig) -> bool:
+    """Return True if config has any phase with exclude_from_results=True."""
+    return any(p.exclude_from_results for p in config.phases)
+
+
+class TestFixedTrialsStrategy:
+    """Tests for FixedTrialsStrategy."""
+
+    @pytest.mark.parametrize(
+        "results,expected",
+        [
+            ([], True),  # No results yet
+            (
+                [
+                    RunResult(
+                        label="run_0001",
+                        success=True,
+                        summary_metrics={
+                            "ttft_avg": JsonMetricResult(unit="ms", avg=100.0)
+                        },
+                        artifacts_path=Path("/tmp/run_0001"),
+                    )
+                ],
+                True,
+            ),  # Partial results
+            (
+                [
+                    RunResult(
+                        label="run_0001",
+                        success=True,
+                        summary_metrics={
+                            "ttft": JsonMetricResult(unit="ms", avg=100.0)
+                        },
+                        artifacts_path=Path("/tmp/run_0001"),
+                    ),
+                    RunResult(
+                        label="run_0002",
+                        success=True,
+                        summary_metrics={
+                            "ttft": JsonMetricResult(unit="ms", avg=105.0)
+                        },
+                        artifacts_path=Path("/tmp/run_0002"),
+                    ),
+                ],
+                False,
+            ),  # Complete results (num_trials=2)
+        ],
+    )
+    def test_should_continue_returns_expected(self, results, expected):
+        """Test should_continue returns expected value based on results count."""
+        num_trials = 2 if len(results) == 2 else 3
+        strategy = FixedTrialsStrategy(num_trials=num_trials)
+        assert strategy.should_continue(results) is expected
+
+    @pytest.mark.parametrize(
+        "run_index,num_trials,expected",
+        [
+            (0, 10, "run_0001"),
+            (1, 10, "run_0002"),
+            (9, 10, "run_0010"),
+            (0, 5, "run_0001"),
+            (4, 5, "run_0005"),
+        ],
+    )
+    def test_get_run_label_zero_padding_returns_expected(
+        self, run_index, num_trials, expected
+    ):
+        """Test get_run_label returns zero-padded labels with correct padding."""
+        strategy = FixedTrialsStrategy(num_trials=num_trials)
+        assert strategy.get_run_label(run_index) == expected
+
+    def test_get_cooldown_seconds_configured_returns_value(self):
+        """Test get_cooldown_seconds returns configured value."""
+        strategy = FixedTrialsStrategy(num_trials=3, cooldown_seconds=5.0)
+        assert strategy.get_cooldown_seconds() == 5.0
+
+    def test_get_cooldown_seconds_default_returns_zero(self):
+        """Test get_cooldown_seconds returns default value of zero."""
+        strategy = FixedTrialsStrategy(num_trials=3)
+        assert strategy.get_cooldown_seconds() == 0.0
+
+    def test_get_next_config_returns_base_config_after_first_run(self):
+        """Test get_next_config returns modified config after first run when warmup disabled."""
+        strategy = FixedTrialsStrategy(num_trials=3, disable_warmup_after_first=True)
+
+        config = _make_config()
+
+        results = [
+            RunResult(
+                label="run_0001",
+                success=True,
+                summary_metrics={"ttft": JsonMetricResult(unit="ms", avg=100.0)},
+                artifacts_path=Path("/tmp/run_0001"),
+            )
+        ]
+
+        new_config = strategy.get_next_config(config, results)
+
+        assert new_config is not config
+        assert not _has_warmup_phase(new_config)
+        assert _has_warmup_phase(config)
+
+    def test_invalid_cooldown_seconds(self):
+        """Test that negative cooldown raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid cooldown_seconds"):
+            FixedTrialsStrategy(num_trials=5, cooldown_seconds=-1.0)
+
+    def test_label_sanitization(self):
+        """Test that labels are sanitized to prevent path traversal."""
+        strategy = FixedTrialsStrategy(num_trials=5)
+
+        assert strategy.get_run_label(0) == "run_0001"
+        assert strategy.get_run_label(99) == "run_0100"
+
+    def test_disable_warmup_after_first_enabled(self):
+        """Test that warmup is disabled after first run when disable_warmup_after_first=True."""
+        strategy = FixedTrialsStrategy(num_trials=3, disable_warmup_after_first=True)
+
+        config = _make_config()
+
+        # First run should preserve warmup
+        first_config = strategy.get_next_config(config, [])
+        assert _has_warmup_phase(first_config)
+        assert any(p.name == "warmup" for p in first_config.phases)
+
+        results = [
+            RunResult(
+                label="run_0001",
+                success=True,
+                summary_metrics={"ttft": JsonMetricResult(unit="ms", avg=100.0)},
+                artifacts_path=Path("/tmp/run_0001"),
+            )
+        ]
+
+        # Second run should have warmup disabled
+        second_config = strategy.get_next_config(config, results)
+        assert not _has_warmup_phase(second_config)
+        assert not any(p.name == "warmup" for p in second_config.phases)
+
+        # Original config should be unchanged
+        assert _has_warmup_phase(config)
+        assert any(p.name == "warmup" for p in config.phases)
+
+    def test_disable_warmup_after_first_disabled(self):
+        """Test that warmup is preserved for all runs when disable_warmup_after_first=False."""
+        strategy = FixedTrialsStrategy(num_trials=3, disable_warmup_after_first=False)
+
+        config = _make_config()
+
+        # First run should preserve warmup
+        first_config = strategy.get_next_config(config, [])
+        assert _has_warmup_phase(first_config)
+        assert any(p.name == "warmup" for p in first_config.phases)
+
+        results = [
+            RunResult(
+                label="run_0001",
+                success=True,
+                summary_metrics={"ttft": JsonMetricResult(unit="ms", avg=100.0)},
+                artifacts_path=Path("/tmp/run_0001"),
+            )
+        ]
+
+        # Second run should STILL have warmup (not disabled)
+        second_config = strategy.get_next_config(config, results)
+        assert _has_warmup_phase(second_config)
+        assert any(p.name == "warmup" for p in second_config.phases)
+
+    def test_disable_warmup_creates_deep_copy(self):
+        """Test that disabling warmup creates a deep copy and doesn't modify original."""
+        strategy = FixedTrialsStrategy(num_trials=3, disable_warmup_after_first=True)
+
+        config = _make_config()
+
+        results = [
+            RunResult(
+                label="run_0001",
+                success=True,
+                summary_metrics={"ttft": JsonMetricResult(unit="ms", avg=100.0)},
+                artifacts_path=Path("/tmp/run_0001"),
+            )
+        ]
+
+        second_config = strategy.get_next_config(config, results)
+
+        assert second_config is not config
+        assert not _has_warmup_phase(second_config)
+
+        assert _has_warmup_phase(config)
+        assert any(p.name == "warmup" for p in config.phases)
+
+    @pytest.mark.parametrize("trial_count", [2, 3, 5, 10])
+    def test_warmup_stripped_on_every_trial_after_first(self, trial_count):
+        """Pin that warmup stripping applies to ALL trials > 1, not just trial 2.
+
+        The condition at strategies.py:224 is `len(results) > 0`, which holds
+        for trial 2, 3, ..., N. Refactoring to `len(results) == 1` would
+        silently re-introduce warmup on trial 3+ with no test failure under
+        the existing two-trial-only coverage.
+        """
+        strategy = FixedTrialsStrategy(
+            num_trials=trial_count + 1, disable_warmup_after_first=True
+        )
+        config = _make_config()
+
+        results = [
+            RunResult(
+                label=f"run_{i:04d}",
+                success=True,
+                summary_metrics={"ttft": JsonMetricResult(unit="ms", avg=100.0)},
+                artifacts_path=Path(f"/tmp/run_{i:04d}"),
+            )
+            for i in range(1, trial_count)
+        ]
+
+        next_config = strategy.get_next_config(config, results)
+        assert not _has_warmup_phase(next_config), (
+            f"Trial {trial_count} (after {len(results)} results) must have "
+            "warmup stripped, not just trial 2."
+        )
+
+    def test_warmup_filter_uses_exclude_from_results_flag(self):
+        """The strip predicate is `exclude_from_results`, not a name match.
+
+        Pin the contract that the filter reads the bool flag. If the framework
+        ever expands the allowed phase-name enum (currently `Literal["warmup",
+        "profiling"]`) to include additional excluded phases like
+        `calibration`, a name-string filter would silently leave them in
+        the measurement. This test asserts the predicate at the call site.
+        """
+        import inspect
+
+        from aiperf.orchestrator.strategies import FixedTrialsStrategy as _FTS
+
+        src = inspect.getsource(_FTS._disable_warmup)
+        assert "exclude_from_results" in src, (
+            "FixedTrialsStrategy._disable_warmup must filter on "
+            "`exclude_from_results`, not a hardcoded name string."
+        )
+
+    def test_disable_warmup_clears_agentic_cache_warmup_duration(self):
+        """Trials 2+ must suppress the synthesized agentic cache-pressure warmup.
+
+        AGENTIC_REPLAY warmup is not a stored ``exclude_from_results`` phase; it
+        is derived from the surviving profiling phase by
+        ``TimingConfig.from_run`` -> ``_build_agentic_warmup_config``, keyed off
+        the profiling phase's ``agentic_cache_warmup_duration``. Stripping the
+        excluded phases alone leaves that field set, so the accelerated
+        cache-pressure substage would re-run on every trial. Pin that
+        ``_disable_warmup`` zeroes it so trials 2+ run with NO warmup at all.
+        """
+        from aiperf.plugin.enums import TimingMode
+
+        strategy = FixedTrialsStrategy(num_trials=3, disable_warmup_after_first=True)
+        config = _make_config(
+            phases=[
+                {
+                    "name": "profiling",
+                    "type": "concurrency",
+                    "requests": 100,
+                    "concurrency": 1,
+                    "timing_mode": TimingMode.AGENTIC_REPLAY,
+                    "agentic_cache_warmup_duration": 30.0,
+                },
+            ],
+        )
+
+        # First trial keeps the cache-pressure warmup on the profiling phase.
+        first_config = strategy.get_next_config(config, [])
+        assert (
+            first_config.get_profiling_phases()[0].agentic_cache_warmup_duration == 30.0
+        )
+
+        results = [
+            RunResult(
+                label="run_0001",
+                success=True,
+                summary_metrics={"ttft": JsonMetricResult(unit="ms", avg=100.0)},
+                artifacts_path=Path("/tmp/run_0001"),
+            )
+        ]
+
+        # Second trial must have the cache-pressure warmup suppressed.
+        second_config = strategy.get_next_config(config, results)
+        for phase in second_config.get_profiling_phases():
+            assert phase.agentic_cache_warmup_duration is None
+
+        # Original config untouched (deep copy).
+        assert config.get_profiling_phases()[0].agentic_cache_warmup_duration == 30.0
+
+    def test_disable_warmup_clears_per_lane_request_budget(self):
+        from aiperf.plugin.enums import TimingMode
+
+        strategy = FixedTrialsStrategy(num_trials=3, disable_warmup_after_first=True)
+        config = _make_config(
+            phases=[
+                {
+                    "name": "profiling",
+                    "type": "concurrency",
+                    "requests": 100,
+                    "concurrency": 1,
+                    "timing_mode": TimingMode.AGENTIC_REPLAY,
+                    "warmup_requests_per_lane": 10,
+                },
+            ],
+        )
+
+        first_config = strategy.get_next_config(config, [])
+        assert first_config.get_profiling_phases()[0].warmup_requests_per_lane == 10
+
+        results = [
+            RunResult(
+                label="run_0001",
+                success=True,
+                summary_metrics={"ttft": JsonMetricResult(unit="ms", avg=100.0)},
+                artifacts_path=Path("/tmp/run_0001"),
+            )
+        ]
+        second_config = strategy.get_next_config(config, results)
+
+        assert second_config.get_profiling_phases()[0].warmup_requests_per_lane is None
+        assert config.get_profiling_phases()[0].warmup_requests_per_lane == 10
+
+    def test_get_run_path(self):
+        """Test get_run_path returns correct path structure."""
+        strategy = FixedTrialsStrategy(num_trials=3)
+        base_dir = Path("/tmp/artifacts")
+
+        path = strategy.get_run_path(base_dir, 0)
+        assert path == Path("/tmp/artifacts/profile_runs/run_0001")
+
+        path = strategy.get_run_path(base_dir, 1)
+        assert path == Path("/tmp/artifacts/profile_runs/run_0002")
+
+        path = strategy.get_run_path(base_dir, 9)
+        assert path == Path("/tmp/artifacts/profile_runs/run_0010")
+
+    def test_get_aggregate_path(self):
+        """Test get_aggregate_path returns correct path."""
+        strategy = FixedTrialsStrategy(num_trials=3)
+        base_dir = Path("/tmp/artifacts")
+
+        path = strategy.get_aggregate_path(base_dir)
+        assert path == Path("/tmp/artifacts/aggregate")
+
+    def test_path_building_consistency(self):
+        """Test that path building is consistent with label generation."""
+        strategy = FixedTrialsStrategy(num_trials=5)
+        base_dir = Path("/tmp/artifacts")
+
+        for run_index in range(5):
+            label = strategy.get_run_label(run_index)
+            path = strategy.get_run_path(base_dir, run_index)
+
+            assert path.name == label
+            # Use os.sep so the literal works on both POSIX (/) and Windows (\\)
+            import os
+
+            assert str(path).endswith(f"profile_runs{os.sep}{label}")
+
+
+class TestAdaptiveStrategy:
+    """Tests for AdaptiveStrategy."""
+
+    def _make_results(
+        self,
+        count: int,
+        metric: str = "time_to_first_token",
+        value: float = 100.0,
+    ) -> list[RunResult]:
+        """Build a list of successful RunResult with summary metrics."""
+        return [
+            RunResult(
+                label=f"run_{i + 1:04d}",
+                success=True,
+                summary_metrics={metric: JsonMetricResult(unit="ms", avg=value + i)},
+                artifacts_path=Path(f"/tmp/run_{i + 1:04d}"),
+            )
+            for i in range(count)
+        ]
+
+    def _make_mock_criterion(self, converged: bool = False) -> MagicMock:
+        mock = MagicMock()
+        mock.is_converged.return_value = converged
+        return mock
+
+    # -- should_continue: convergence logic --
+
+    def test_criterion_true_stops_after_min_runs(self):
+        """When criterion reports converged, stop as soon as min_runs is met."""
+        criterion = self._make_mock_criterion(converged=True)
+        strategy = AdaptiveStrategy(criterion=criterion, min_runs=3, max_runs=10)
+
+        results = self._make_results(3)
+        assert strategy.should_continue(results) is False
+
+    def test_criterion_false_runs_to_max(self):
+        """When criterion never converges, run until max_runs."""
+        criterion = self._make_mock_criterion(converged=False)
+        strategy = AdaptiveStrategy(criterion=criterion, min_runs=3, max_runs=5)
+
+        for n in range(1, 5):
+            assert strategy.should_continue(self._make_results(n)) is True
+        assert strategy.should_continue(self._make_results(5)) is False
+
+    def test_criterion_flips_true_at_run_4(self):
+        """Criterion flips to converged at run 4 -> stops at 4."""
+        criterion = MagicMock()
+        criterion.is_converged.side_effect = [False, True]
+        strategy = AdaptiveStrategy(criterion=criterion, min_runs=3, max_runs=10)
+
+        # Run 3: first convergence check -> False -> continue
+        assert strategy.should_continue(self._make_results(3)) is True
+        # Run 4: second convergence check -> True -> stop
+        assert strategy.should_continue(self._make_results(4)) is False
+
+    def test_min_runs_floor_enforced(self):
+        """Even if criterion says converged, continue below min_runs."""
+        criterion = self._make_mock_criterion(converged=True)
+        strategy = AdaptiveStrategy(criterion=criterion, min_runs=5, max_runs=10)
+
+        for n in range(1, 5):
+            assert strategy.should_continue(self._make_results(n)) is True
+        # Criterion is never called below min_runs
+        criterion.is_converged.assert_not_called()
+
+    def test_max_runs_cap_enforced(self):
+        """Stop at max_runs even if criterion says not converged."""
+        criterion = self._make_mock_criterion(converged=False)
+        strategy = AdaptiveStrategy(criterion=criterion, min_runs=3, max_runs=5)
+
+        assert strategy.should_continue(self._make_results(5)) is False
+        assert strategy.should_continue(self._make_results(6)) is False
+
+    def test_empty_results_continues(self):
+        """No results yet -> always continue."""
+        criterion = self._make_mock_criterion(converged=True)
+        strategy = AdaptiveStrategy(criterion=criterion, min_runs=3, max_runs=10)
+        assert strategy.should_continue([]) is True
+
+    def test_criterion_exception_treated_as_not_converged(self, caplog):
+        """If criterion raises, log error and treat as not converged."""
+        criterion = MagicMock()
+        criterion.is_converged.side_effect = RuntimeError("boom")
+        strategy = AdaptiveStrategy(criterion=criterion, min_runs=3, max_runs=10)
+
+        results = self._make_results(3)
+        assert strategy.should_continue(results) is True
+        assert "Convergence criterion raised an error" in caplog.text
+
+    # -- Label parity with FixedTrialsStrategy --
+
+    @pytest.mark.parametrize("run_index", [0, 1, 99, 9999])
+    def test_label_parity_with_fixed_trials(self, run_index):
+        """AdaptiveStrategy labels must match FixedTrialsStrategy labels."""
+        criterion = self._make_mock_criterion()
+        adaptive = AdaptiveStrategy(criterion=criterion)
+        fixed = FixedTrialsStrategy(num_trials=10000)
+
+        assert adaptive.get_run_label(run_index) == fixed.get_run_label(run_index)
+
+    # -- Path parity --
+
+    @pytest.mark.parametrize("run_index", [0, 1, 99, 9999])
+    def test_run_path_parity_with_fixed_trials(self, run_index):
+        """AdaptiveStrategy run paths must match FixedTrialsStrategy."""
+        criterion = self._make_mock_criterion()
+        adaptive = AdaptiveStrategy(criterion=criterion)
+        fixed = FixedTrialsStrategy(num_trials=10000)
+        base_dir = Path("/tmp/artifacts")
+
+        assert adaptive.get_run_path(base_dir, run_index) == fixed.get_run_path(
+            base_dir, run_index
+        )
+
+    def test_aggregate_path_parity_with_fixed_trials(self):
+        """AdaptiveStrategy aggregate path must match FixedTrialsStrategy."""
+        criterion = self._make_mock_criterion()
+        adaptive = AdaptiveStrategy(criterion=criterion)
+        fixed = FixedTrialsStrategy(num_trials=5)
+        base_dir = Path("/tmp/artifacts")
+
+        assert adaptive.get_aggregate_path(base_dir) == fixed.get_aggregate_path(
+            base_dir
+        )
+
+    # -- Config parity (warmup disabling) --
+
+    def test_disable_warmup_after_first_run(self):
+        """Warmup disabled for runs after the first."""
+        criterion = self._make_mock_criterion()
+        strategy = AdaptiveStrategy(
+            criterion=criterion, disable_warmup_after_first=True
+        )
+
+        config = _make_config()
+
+        # First run: warmup preserved
+        first = strategy.get_next_config(config, [])
+        assert _has_warmup_phase(first)
+        assert any(p.name == "warmup" for p in first.phases)
+
+        # Second run: warmup disabled
+        results = self._make_results(1)
+        second = strategy.get_next_config(config, results)
+        assert not _has_warmup_phase(second)
+        assert not any(p.name == "warmup" for p in second.phases)
+
+        # Original unchanged
+        assert _has_warmup_phase(config)
+        assert any(p.name == "warmup" for p in config.phases)
+
+    def test_disable_warmup_after_first_disabled(self):
+        """Warmup preserved for all runs when disable_warmup_after_first=False."""
+        criterion = self._make_mock_criterion()
+        strategy = AdaptiveStrategy(
+            criterion=criterion, disable_warmup_after_first=False
+        )
+
+        config = _make_config()
+
+        results = self._make_results(1)
+        second = strategy.get_next_config(config, results)
+        assert _has_warmup_phase(second)
+        assert any(p.name == "warmup" for p in second.phases)
+
+    @pytest.mark.skip(
+        reason="random_seed moved to AIPerfConfig envelope (Task 8); test obsolete"
+    )
+    def test_config_parity_seed_and_warmup_with_fixed_trials(self):
+        """Full config transformation parity between Adaptive and Fixed strategies."""
+        criterion = self._make_mock_criterion()
+        adaptive = AdaptiveStrategy(
+            criterion=criterion,
+            disable_warmup_after_first=True,
+        )
+        fixed = FixedTrialsStrategy(
+            num_trials=10,
+            disable_warmup_after_first=True,
+        )
+
+        config = _make_config(random_seed=None)
+
+        results = self._make_results(1)
+
+        adaptive_cfg = adaptive.get_next_config(config, results)
+        fixed_cfg = fixed.get_next_config(config, results)
+
+        assert adaptive_cfg.random_seed == fixed_cfg.random_seed
+        assert _has_warmup_phase(adaptive_cfg) == _has_warmup_phase(fixed_cfg)
+
+    # -- Cooldown --
+
+    def test_cooldown_seconds_configured(self):
+        criterion = self._make_mock_criterion()
+        strategy = AdaptiveStrategy(criterion=criterion, cooldown_seconds=2.5)
+        assert strategy.get_cooldown_seconds() == 2.5
+
+    def test_cooldown_seconds_default(self):
+        criterion = self._make_mock_criterion()
+        strategy = AdaptiveStrategy(criterion=criterion)
+        assert strategy.get_cooldown_seconds() == 0.0
+
+    # -- Constructor validation --
+
+    def test_invalid_cooldown_raises(self):
+        criterion = self._make_mock_criterion()
+        with pytest.raises(ValueError, match="Invalid cooldown_seconds"):
+            AdaptiveStrategy(criterion=criterion, cooldown_seconds=-1.0)
+
+    def test_invalid_min_runs_raises(self):
+        criterion = self._make_mock_criterion()
+        with pytest.raises(ValueError, match="Invalid min_runs"):
+            AdaptiveStrategy(criterion=criterion, min_runs=0)
+
+    def test_invalid_max_runs_raises(self):
+        criterion = self._make_mock_criterion()
+        with pytest.raises(ValueError, match="Invalid max_runs"):
+            AdaptiveStrategy(criterion=criterion, min_runs=5, max_runs=3)
+
+    # -- Cross-endpoint metric names (chat, embeddings, audio) --
+
+    @pytest.mark.parametrize(
+        "metric_name",
+        [
+            "time_to_first_token",
+            "request_latency",
+            "output_token_throughput",
+        ],
+    )
+    def test_convergence_with_varied_metric_names(self, metric_name):
+        """AdaptiveStrategy works with metrics from different endpoint types."""
+        criterion = MagicMock()
+        criterion.is_converged.return_value = True
+        strategy = AdaptiveStrategy(criterion=criterion, min_runs=3, max_runs=10)
+
+        results = self._make_results(3, metric=metric_name)
+        assert strategy.should_continue(results) is False
+        criterion.is_converged.assert_called_once_with(results)
+
+
+class TestSweepMode:
+    """Tests for the SweepMode enum."""
+
+    @pytest.mark.parametrize(
+        ("member", "expected"),
+        [
+            param(SweepMode.INDEPENDENT, "independent", id="independent"),
+            param(SweepMode.REPEATED, "repeated", id="repeated"),
+        ],
+    )  # fmt: skip
+    def test_value(self, member, expected):
+        assert member == expected
+
+    def test_members(self):
+        assert {m.value for m in SweepMode} == {"independent", "repeated"}
+
+
+class TestSanitizeLabel:
+    """Tests for the module-level _sanitize_label helper."""
+
+    @pytest.mark.parametrize(
+        ("label", "expected"),
+        [
+            param("../foo", "foo", id="parent_dir_traversal"),
+            param("foo/bar\\baz", "foobarbaz", id="path_separators"),
+            param('a<b>c|d:e"f?g*h', "abcdefgh", id="shell_special_chars"),
+            param("concurrency_10", "concurrency_10", id="passthrough_safe"),
+            param("run_0001", "run_0001", id="passthrough_run"),
+        ],
+    )  # fmt: skip
+    def test_sanitize(self, label, expected):
+        assert _sanitize_label(label) == expected

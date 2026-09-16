@@ -1,0 +1,305 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+navigation:
+- page: Welcome to AIPerf Documentation
+  path: index.md
+
+- section: Getting Started
+  contents:
+  - page: Profiling with AIPerf
+    path: tutorial.md
+  - page: "AIPerf: Comprehensive LLM Benchmarking"
+    path: comprehensive-llm-benchmarking.md
+  - page: Interactive Chat Sanity Checks
+    path: tutorials/interactive-chat.md
+  - page: Migrating from GenAI-Perf
+    path: migrating.md
+  - page: GenAI-Perf vs AIPerf CLI Feature Comparison Matrix
+    path: genai-perf-feature-comparison.md
+
+- section: Tutorials
+  contents:
+  - section: Model & Endpoint Guides
+    collapsed: true
+    contents:
+    - page: Profile OpenAI-Compatible Text APIs Using AIPerf
+      path: tutorials/openai-text-endpoints.md
+    - page: Profile the OpenAI Responses API with AIPerf
+      path: tutorials/openai-responses.md
+    - page: Profile the Anthropic Messages API with AIPerf
+      path: tutorials/anthropic-messages-endpoint.md
+    - page: Profile Hugging Face TGI Models with AIPerf
+      path: tutorials/huggingface-tgi.md
+    - page: Profile Vision Language Models with AIPerf
+      path: tutorials/vision.md
+    - page: Profile Audio Language Models with AIPerf
+      path: tutorials/audio.md
+    - page: Profile ASR Models with AIPerf
+      path: tutorials/asr.md
+    - page: Profile Embedding Models with AIPerf
+      path: tutorials/embeddings.md
+    - page: Profile Ranking Models with AIPerf
+      path: tutorials/rankings.md
+    - page: Profile NIM Image Retrieval with AIPerf
+      path: tutorials/nim-image-retrieval.md
+    - page: SGLang Image Generation
+      path: tutorials/image-generation.md
+    - page: SGLang Image Edit
+      path: tutorials/sglang-image-edit.md
+    - page: SGLang Video Generation
+      path: tutorials/sglang-video-generation.md
+    - page: Synthetic Video Generation
+      path: tutorials/synthetic-video.md
+    - page: Template Endpoint
+      path: tutorials/template-endpoint.md
+  - section: Datasets & Inputs
+    collapsed: true
+    contents:
+    - page: Custom Dataset Guide
+      path: tutorials/custom-dataset.md
+    - page: Inline Datasets
+      path: tutorials/inline-datasets.md
+    - page: Custom Prompt Benchmarking
+      path: tutorials/custom-prompt-benchmarking.md
+    - page: Profile with ShareGPT Dataset
+      path: tutorials/sharegpt.md
+    - page: Synthetic Dataset Generation
+      path: tutorials/synthetic-dataset.md
+    - page: Profile with InstructCoder Dataset
+      path: tutorials/instruct-coder.md
+    - page: Profile with AIMO Dataset
+      path: tutorials/aimo.md
+    - page: Profile with MMStar Dataset
+      path: tutorials/mmstar.md
+    - page: Profile with MMVU Dataset
+      path: tutorials/mmvu.md
+    - page: Profile with LLaVA-OneVision Dataset
+      path: tutorials/llava-onevision.md
+    - page: Profile with VisionArena Dataset
+      path: tutorials/vision-arena.md
+    - page: Profile with Blazedit Dataset
+      path: tutorials/blazedit.md
+    - page: Profile with SpecBench Dataset
+      path: tutorials/spec-bench.md
+    - page: Profile with SPEED-Bench Dataset
+      path: tutorials/speed-bench.md
+    - page: Per-Request Speculative-Decoding Metrics
+      path: tutorials/spec-decode-metrics.md
+    - page: Profile with Bailian Traces
+      path: tutorials/bailian-trace.md
+    - page: Profile with BurstGPT Traces
+      path: tutorials/burst-gpt-trace.md
+    - page: Replay SageMaker Data Capture Traces
+      path: tutorials/sagemaker-data-capture.md
+    - page: Raw Payload Replay
+      path: tutorials/raw-payload-replay.md
+    - page: Inputs JSON Replay
+      path: tutorials/inputs-json-replay.md
+    - page: Multi-Turn Conversations
+      path: tutorials/multi-turn.md
+    - page: Sequence Length Distributions for Advanced Benchmarking
+      path: tutorials/sequence-distributions.md
+    - page: Prefix Data Synthesis Tutorial
+      path: tutorials/prefix-synthesis.md
+    - page: Agentic Code Dataset Generator
+      path: tutorials/agentic-code-generator.md
+    - page: Replay Weka Agentic Coding Traces
+      path: tutorials/weka-trace.md
+    - page: InferenceX AgentX MVP Benchmark
+      path: tutorials/agentx-mvp.md
+    - page: InferenceX AgentX MVP 基准测试（中文）
+      path: tutorials/agentx-mvp-zh.md
+  - section: Load Patterns & Scheduling
+    collapsed: true
+    contents:
+    - page: "Arrival Patterns: Simulating Realistic Traffic"
+      path: tutorials/arrival-patterns.md
+    - page: Fixed Schedule Benchmarking
+      path: tutorials/fixed-schedule.md
+    - page: Gradual Ramping
+      path: tutorials/ramping.md
+    - page: Request Rate with Max Concurrency
+      path: tutorials/request-rate-concurrency.md
+    - page: "Prefill Concurrency: Fine-Grained Benchmarking Control"
+      path: tutorials/prefill-concurrency.md
+    - page: Adaptive Scale
+      path: tutorials/adaptive-scale.md
+    - page: Multi-Phase Workflows
+      path: tutorials/multi-phase-workflows.md
+    - page: Time-Based Benchmarking
+      path: tutorials/time-based-benchmarking.md
+    - page: Multi-URL Load Balancing
+      path: tutorials/multi-url-load-balancing.md
+    - page: Request Cancellation Testing
+      path: tutorials/request-cancellation.md
+    - page: Warmup Phase Configuration
+      path: tutorials/warmup.md
+  - section: Metrics & Analysis
+    collapsed: true
+    contents:
+    - page: Benchmark Goodput with AIPerf
+      path: tutorials/goodput.md
+    - page: Multi-Run Confidence Reporting
+      path: tutorials/multi-run-confidence.md
+    - page: Parameter Sweeps
+      path: tutorials/sweeps.md
+    - page: Adaptive Search
+      path: tutorials/adaptive-search.md
+    - page: Adaptive Scale
+      path: tutorials/adaptive-scale.md
+    - page: Time Slicing for Performance Analysis
+      path: tutorials/timeslices.md
+    - page: HTTP Trace Metrics Guide
+      path: tutorials/http-trace-metrics.md
+    - page: Working with Profile Export Files
+      path: tutorials/working-with-profile-exports.md
+    - page: Visualization and Plotting with AIPerf
+      path: tutorials/plot.md
+    - page: Auto-Plot After `aiperf profile`
+      path: tutorials/auto-plot.md
+    - page: User-Centric Timing for KV Cache Benchmarking
+      path: tutorials/user-centric-timing.md
+    - page: GPU Telemetry with AIPerf
+      path: tutorials/gpu-telemetry.md
+    - page: OpenTelemetry MLflow Integration
+      path: tutorials/otel-mlflow.md
+    - page: Weights & Biases Export
+      path: tutorials/wandb.md
+  - section: Configuration
+    collapsed: true
+    contents:
+    - page: YAML Configuration Files
+      path: tutorials/yaml-config.md
+    - page: Sampling Distributions in YAML Configs
+      path: tutorials/yaml-distributions.md
+    - page: User Interface
+      path: tutorials/ui-types.md
+    - page: Using Local Tokenizers Without HuggingFace
+      path: tutorials/local-tokenizer.md
+    - page: "Random Number Generation & Reproducibility"
+      path: reproducibility.md
+
+- section: Sweeping & Adaptive Search
+  collapsed: true
+  contents:
+  - page: Search Recipes
+    path: sweeping/search-recipes.md
+  - page: Bayesian Optimization
+    path: sweeping/bayesian-optimization.md
+  - page: Space-filling Sweeps (Sobol, Latin Hypercube)
+    path: sweeping/space-filling.md
+
+- section: Benchmark Modes
+  collapsed: true
+  contents:
+  - page: Load Generator Options Reference
+    path: benchmark-modes/timing-modes-reference.md
+  - page: Trace Replay with Mooncake Traces
+    path: benchmark-modes/trace-replay.md
+  - page: Baseten Trace Replay
+    path: tutorials/baseten-trace.md
+  - page: Conversation DAG Benchmarks
+    path: benchmark-modes/dag.md
+  - page: "SemiAnalysis AgentX: How the Benchmark Works (FAQ)"
+    path: benchmark-modes/semianalysis-agentx-faq.md
+
+- section: Accuracy
+  collapsed: true
+  contents:
+  - page: Accuracy Benchmarking
+    path: accuracy/accuracy-benchmarking.md
+
+- section: Reference
+  collapsed: true
+  contents:
+  - page: Command Line Options
+    path: cli-options.md
+  - page: Environment Variables
+    path: environment-variables.md
+  - page: AIPerf Metrics Reference
+    path: metrics-reference.md
+  - page: GPU Telemetry & Power-Efficiency Dataflow
+    path: reference/gpu-telemetry-metrics-dataflow.md
+  - page: Benchmark Datasets
+    path: benchmark-datasets.md
+  - page: Pre-Flight Tokenizer Auto Detection
+    path: reference/tokenizer-auto-detection.md
+  - page: Input Sequence Length (ISL) Tokenization
+    path: reference/isl-tokenization.md
+  - page: Prompt Corpus Selection
+    path: reference/prompt-corpus.md
+  - page: ISL Budget Compensation Derivation
+    path: reference/isl-budget-compensation.md
+  - page: Conversation Context Mode
+    path: reference/conversation-context-mode.md
+  - page: List-Metric Aggregation
+    path: reference/list-metric-aggregation.md
+  - page: Effective vs Active Metrics
+    path: reference/effective-vs-active-metrics.md
+  - page: Vendor Usage Field Reference
+    path: reference/vendor-usage-fields.md
+  - page: Per-Request Speculative-Decoding Acceptance
+    path: reference/spec-decode-acceptance.md
+  - page: JSON Export Schema
+    path: reference/json-export-schema.md
+  - page: HTTP API Endpoints
+    path: reference/api-endpoints.md
+  - page: YAML Config Roadmap
+    path: reference/yaml-config-roadmap.md
+  - page: Mocking a ROCm Environment
+    path: reference/mock-amdsmi.md
+
+- section: Server Metrics
+  collapsed: true
+  contents:
+  - page: Server Metrics Collection
+    path: server-metrics/server-metrics.md
+  - page: AIPerf Server Metrics Reference
+    path: server-metrics/server-metrics-reference.md
+  - page: AIPerf Server Metrics JSON Export Schema
+    path: server-metrics/server-metrics-json-schema.md
+  - page: AIPerf Server Metrics Parquet Export Schema
+    path: server-metrics/server-metrics-parquet-schema.md
+
+- section: Plugins
+  collapsed: true
+  contents:
+  - page: AIPerf Plugin System
+    path: plugins/plugin-system.md
+  - page: Creating Your First AIPerf Plugin
+    path: plugins/creating-your-first-plugin.md
+
+- section: API
+  collapsed: true
+  contents:
+  - page: Prefix Synthesis API Reference
+    path: api/synthesis.md
+  - page: Sweep Aggregates API Reference
+    path: api/sweep-aggregates.md
+  - page: Search History API Reference
+    path: api/search-history.md
+
+- section: Architecture & Internals
+  collapsed: true
+  contents:
+  - page: Architecture of AIPerf
+    path: architecture.md
+  - page: Metrics Flow
+    path: diagrams/metrics-flow.md
+  - page: Mixins
+    path: diagrams/mixins.md
+  - page: AIPerf Code Patterns
+    path: dev/patterns.md
+  - page: Global Property-Test Invariants
+    path: dev/global-invariants.md
+  - page: Sweep Orchestrator (Dev Reference)
+    path: dev/sweep-orchestrator.md
+  - page: YAML Config Future Goals
+    path: dev/yaml-config-future-goals.md
+
+- section: Troubleshooting
+  collapsed: true
+  contents:
+  - page: Sweep & Adaptive Search Errors
+    path: troubleshooting/sweeps.md

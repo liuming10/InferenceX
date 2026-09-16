@@ -1,0 +1,1554 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import asyncio
+import base64
+import hashlib
+import logging
+import random
+import time
+from collections.abc import Mapping
+from contextlib import asynccontextmanager
+from time import perf_counter
+from typing import Any
+
+import orjson
+from aiperf_mock_server.config import (
+    MockServerConfig,
+    public_config_dump,
+    server_config,
+)
+from aiperf_mock_server.dcgm_faker import DCGMFaker
+from aiperf_mock_server.metrics import (
+    AIPERF_MOCK_REGISTRY,
+    DYNAMO_DECODE_REGISTRY,
+    DYNAMO_FRONTEND_REGISTRY,
+    DYNAMO_PREFILL_REGISTRY,
+    SERVER_UPTIME_SECONDS,
+    SGLANG_REGISTRY,
+    STREAMING_REQUESTS_TOTAL,
+    TRTLLM_REGISTRY,
+    VLLM_REGISTRY,
+)
+from aiperf_mock_server.metrics_utils import (
+    async_track_llm_request,
+    async_track_request,
+    init_model_config,
+    record_embedding_success,
+    record_image_retrieval_success,
+    record_ranking_success,
+    record_request_bytes,
+    record_tgi_success,
+    register_dcgm_load_callback,
+    track_llm_request,
+    track_request,
+)
+from aiperf_mock_server.models import (
+    AnthropicMessagesRequest,
+    ChatCompletionRequest,
+    CohereRerankRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+    HFTEIRerankRequest,
+    ImageGenerationRequest,
+    ImageRetrievalRequest,
+    RankingRequest,
+    SolidoRAGRequest,
+    TGIGenerateRequest,
+)
+from aiperf_mock_server.node_exporter_faker import (
+    render_default as render_node_exporter,
+)
+from aiperf_mock_server.request_recorder import RequestRecorder, set_global_recorder
+from aiperf_mock_server.scheduler import init_scheduler, shutdown_scheduler
+from aiperf_mock_server.utils import (
+    RequestCtx,
+    anthropic_stop_reason,
+    make_ctx,
+    simulate_anthropic_cache,
+    stream_anthropic_messages,
+    stream_chat_completion,
+    stream_text_completion,
+    stream_tgi_completion,
+    with_error_injection,
+)
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi.responses import ORJSONResponse, PlainTextResponse, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
+from starlette.requests import Request
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+dcgm_fakers: list[DCGMFaker] = []
+server_start_time: float = 0.0
+logger = logging.getLogger(__name__)
+
+
+def metrics_response(registry: CollectorRegistry) -> Response:
+    """Generate a Prometheus metrics response from a registry."""
+    return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+
+
+def _create_dcgm_faker(seed: int | None) -> DCGMFaker:
+    """Create a DCGM faker instance with current config."""
+    return DCGMFaker(
+        gpu_name=server_config.dcgm_gpu_name,
+        num_gpus=server_config.dcgm_num_gpus,
+        seed=seed,
+        hostname=server_config.dcgm_hostname,
+    )
+
+
+def _update_dcgm_load(load: float) -> None:
+    """Update load on all DCGM fakers based on inflight requests."""
+    for faker in dcgm_fakers:
+        faker.set_load(load)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Initialize server on startup."""
+    global server_start_time
+    server_start_time = time.time()
+    logger.info("Server starting: %s", public_config_dump(server_config))
+    if server_config.random_seed is not None:
+        random.seed(server_config.random_seed)
+
+    if not server_config.no_tokenizer:
+        from aiperf_mock_server.tokens import _load_corpus
+
+        _load_corpus()
+
+    dcgm_fakers.append(_create_dcgm_faker(server_config.dcgm_seed))
+    dcgm_fakers.append(
+        _create_dcgm_faker(
+            None if server_config.dcgm_seed is None else server_config.dcgm_seed + 1
+        )
+    )
+
+    # Register callback to update DCGM load based on token throughput (auto-scaling)
+    if server_config.dcgm_auto_load:
+        register_dcgm_load_callback(
+            _update_dcgm_load,
+            server_config.dcgm_min_throughput,
+            server_config.dcgm_window_sec,
+        )
+
+    if server_config.dcgm_auto_load:
+        logger.info(
+            "DCGM faker initialized with %d %s GPUs (auto-load enabled, %.1fs window)",
+            server_config.dcgm_num_gpus,
+            server_config.dcgm_gpu_name,
+            server_config.dcgm_window_sec,
+        )
+    else:
+        logger.info(
+            "DCGM faker initialized with %d %s GPUs (auto-load disabled)",
+            server_config.dcgm_num_gpus,
+            server_config.dcgm_gpu_name,
+        )
+
+    recorder: RequestRecorder | None = None
+    if server_config.record_requests is not None:
+        recorder = RequestRecorder(
+            path=server_config.record_requests,
+            tokenizer_name=server_config.tokenizer,
+            tokenizer_revision=server_config.tokenizer_revision,
+            trust_remote_code=server_config.tokenizer_trust_remote_code,
+        )
+        recorder.open()
+        set_global_recorder(recorder)
+
+    try:
+        await init_scheduler(server_config)
+    except BaseException:
+        # init_scheduler raised after recorder.open() — the `try: yield ...
+        # finally:` cleanup below is never entered, so we have to close the
+        # recorder and unregister the global handle here or the summary is
+        # silently never written.
+        if recorder is not None:
+            set_global_recorder(None)
+            recorder.close()
+        raise
+
+    try:
+        yield
+    finally:
+        # Recorder cleanup must run even when `shutdown_scheduler()` raises —
+        # otherwise the `--record-requests` summary.json is never written,
+        # which is the whole reason the user enabled the mode.
+        try:
+            await shutdown_scheduler()
+        finally:
+            if recorder is not None:
+                set_global_recorder(None)
+                recorder.close()
+
+
+app = FastAPI(title="AIPerf Mock Server", version="2.0.0", lifespan=lifespan)
+
+
+class TimingMiddleware:
+    """Pure ASGI middleware - captures timing before ANY processing."""
+
+    def __init__(self, inner_app):
+        self.app = inner_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # Initialize state dict if not present (e.g., in test environments)
+            if "state" not in scope:
+                scope["state"] = {}
+            scope["state"]["start_time"] = perf_counter()
+        await self.app(scope, receive, send)
+
+
+_INFERENCE_PATHS: frozenset[str] = frozenset(
+    {"/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/messages"}
+)
+_AUTH_PROTECTED_PATHS: frozenset[str] = frozenset(
+    {
+        "/generate",
+        "/generate_stream",
+        "/rag/api/prompt",
+        "/rerank",
+        "/v1/chat/completions",
+        "/v1/chat/embeddings",
+        "/v1/completions",
+        "/v1/custom-multimodal",
+        "/v1/embeddings",
+        "/v1/image/infer",
+        "/v1/images/edits",
+        "/v1/images/generations",
+        "/v1/infer",
+        "/v1/messages",
+        "/v1/ranking",
+        "/v1/responses",
+        "/v1/videos",
+        "/v2/rerank",
+    }
+)
+
+
+def _is_auth_protected_path(path: str) -> bool:
+    return path in _AUTH_PROTECTED_PATHS or path.startswith("/v1/videos/")
+
+
+def _asgi_headers(headers: object) -> Mapping[str, str]:
+    if not isinstance(headers, list):
+        return {}
+
+    result: dict[str, str] = {}
+    for item in headers:
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+        name, value = item
+        if isinstance(name, bytes) and isinstance(value, bytes):
+            result[name.decode("latin-1").lower()] = value.decode("latin-1")
+    return result
+
+
+class InferenceAuthMiddleware:
+    """Enforces optional API-key auth on inference endpoints."""
+
+    def __init__(self, inner_app: ASGIApp, config: MockServerConfig) -> None:
+        self.app = inner_app
+        self.config = config
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = str(scope.get("path", ""))
+        if (
+            scope["type"] == "http"
+            and self.config.api_key is not None
+            and _is_auth_protected_path(path)
+        ):
+            headers = _asgi_headers(scope.get("headers"))
+            header_name = self.config.auth_header_name.lower()
+            header_value = headers.get(header_name)
+            # aiperf --api-key sends "Authorization: Bearer <api_key>"
+            authorized = header_value == self.config.api_key or (
+                header_name == "authorization"
+                and header_value == f"Bearer {self.config.api_key}"
+            )
+            if not authorized:
+                body = orjson.dumps({"error": "Unauthorized"})
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode()),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+class InferenceReadinessMiddleware:
+    """Returns HTTP 503 on inference paths while within the configured
+    startup delay. Used by readiness-probe tests to simulate a server
+    whose frontend is up but whose workers haven't loaded weights yet."""
+
+    def __init__(self, inner_app: ASGIApp) -> None:
+        self.app = inner_app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] == "http"
+            and server_config.inference_ready_delay_seconds > 0
+            and scope.get("path") in _INFERENCE_PATHS
+            and server_start_time > 0
+            and (time.time() - server_start_time)
+            < server_config.inference_ready_delay_seconds
+        ):
+            body = orjson.dumps(
+                {"error": "Model not ready: workers still loading weights"}
+            )
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
+
+
+# Wrap FastAPI with ASGI middleware for earliest possible timing
+asgi_app = InferenceAuthMiddleware(
+    InferenceReadinessMiddleware(TimingMiddleware(app)), server_config
+)
+
+
+# ============================================================================
+# Chat Completions
+# ============================================================================
+
+
+def _build_chat_response_data(ctx: RequestCtx) -> dict[str, Any]:
+    """Build non-streaming chat completion response data."""
+    message: dict[str, Any] = {"role": "assistant", "content": ctx.content}
+    if ctx.reasoning_content:
+        message["reasoning_content"] = ctx.reasoning_content
+    return {
+        "id": ctx.request_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": ctx.model,
+        "choices": [
+            {"index": 0, "finish_reason": ctx.finish_reason, "message": message}
+        ],
+        "usage": ctx.usage,
+    }
+
+
+@app.post("/v1/chat/completions", response_model=None)
+@with_error_injection
+async def chat_completions(
+    req: ChatCompletionRequest,
+    request: Request,
+) -> ORJSONResponse | StreamingResponse:
+    """Chat completion endpoint."""
+    endpoint = "/v1/chat/completions"
+    init_model_config(req.model)
+    ctx = make_ctx(req, endpoint, request.state.start_time)
+
+    if req.stream:
+        STREAMING_REQUESTS_TOTAL.labels(endpoint=endpoint, model=req.model).inc()
+        return StreamingResponse(
+            _chat_stream_wrapper(ctx, req, endpoint),
+            media_type="text/event-stream",
+        )
+
+    with track_llm_request(ctx, req.model, endpoint):
+        await ctx.latency_sim.wait_for_tokens(len(ctx.tokens))
+        response_data = _build_chat_response_data(ctx)
+        response_bytes = len(orjson.dumps(response_data))
+        record_request_bytes(endpoint, len(ctx.tokenized.text), response_bytes)
+        return ORJSONResponse(response_data)
+
+
+async def _chat_stream_wrapper(
+    ctx: RequestCtx, req: ChatCompletionRequest, endpoint: str
+):
+    """Wrapper for streaming that records metrics after completion."""
+    async with async_track_llm_request(ctx, req.model, endpoint):
+        async for chunk in stream_chat_completion(ctx, endpoint, req.include_usage):
+            yield chunk
+
+
+# ============================================================================
+# Anthropic Messages
+# ============================================================================
+
+
+def _should_emit_tool_use(req: AnthropicMessagesRequest) -> dict[str, Any] | None:
+    """Return the synthesised tool_use block to emit, or None if tools aren't
+    declared on the request.
+
+    Triggered whenever the request declares ``tools`` unless ``tool_choice``
+    is ``{"type":"none"}``. ``{"type":"auto"}`` synthesises too — deliberately:
+    absent ``tool_choice`` defaults to ``auto`` on the real API, so the two
+    must behave identically, and a deterministic mock that always exercises
+    the tool path beats probabilistic realism for benchmarking. Picks the
+    first declared tool's ``name`` and fabricates an ``input`` dict so a
+    FORK-mode replay sees the parent's tool_use round-trip through
+    ``build_assistant_turn``.
+    """
+    tools = req.tools
+    if not tools:
+        return None
+    choice_type = (req.tool_choice or {}).get("type")
+    if choice_type == "none":
+        return None
+    first = tools[0] if isinstance(tools[0], dict) else {}
+    name = first.get("name") or "mock_tool"
+    return {
+        "type": "tool_use",
+        "id": "toolu_mock_1",
+        "name": name,
+        "input": {"arg": "value"},
+    }
+
+
+def _anthropic_cache_requested(req: AnthropicMessagesRequest) -> bool:
+    """True when the request opts into prompt caching.
+
+    Recognizes the top-level ``cache_control`` (automatic caching mode) plus
+    per-block ``cache_control`` markers on system blocks or message content
+    blocks - the same opt-in surfaces the real API accepts.
+    """
+    if req.cache_control is not None:
+        return True
+    if isinstance(req.system, list) and any(
+        isinstance(b, dict) and b.get("cache_control") for b in req.system
+    ):
+        return True
+    for message in req.messages:
+        content = message.content
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("cache_control") for b in content
+        ):
+            return True
+    return False
+
+
+def _anthropic_cache_triple(
+    ctx: RequestCtx, req: AnthropicMessagesRequest
+) -> tuple[int, int, int]:
+    """Disjoint ``(input, cache_read, cache_creation)`` accounting for ``req``.
+
+    No-cache identity (full prompt as uncached ``input_tokens``) unless the
+    request opts into caching, in which case the simulated prefix cache
+    reports reads/creations exactly like the real API's disjoint accounting.
+    """
+    total = ctx.usage["prompt_tokens"]
+    if not _anthropic_cache_requested(req):
+        return total, 0, 0
+    return simulate_anthropic_cache(
+        req.model,
+        req.system,
+        [m.model_dump() for m in req.messages],
+        total,
+    )
+
+
+def _build_anthropic_response_data(
+    ctx: RequestCtx,
+    req: AnthropicMessagesRequest | None = None,
+    cache_triple: tuple[int, int, int] | None = None,
+) -> dict[str, Any]:
+    """Build non-streaming Anthropic Messages response data.
+
+    When ``req`` is supplied and declares ``tools``, append a synthesised
+    ``tool_use`` block after any text/thinking and set
+    ``stop_reason="tool_use"``.
+    """
+    content: list[dict[str, Any]] = []
+
+    if ctx.reasoning_content:
+        content.append(
+            {
+                "type": "thinking",
+                "thinking": ctx.reasoning_content,
+                "signature": "mock-signature",
+            }
+        )
+
+    content.append({"type": "text", "text": ctx.content})
+
+    stop_reason = anthropic_stop_reason(ctx.finish_reason)
+    tool_use_block = _should_emit_tool_use(req) if req is not None else None
+    if tool_use_block is not None:
+        content.append(tool_use_block)
+        stop_reason = "tool_use"
+
+    total = ctx.usage["prompt_tokens"]
+    input_tokens, cache_read, cache_creation = cache_triple or (total, 0, 0)
+    return {
+        "id": ctx.request_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": ctx.model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": ctx.usage["completion_tokens"],
+            "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read,
+        },
+    }
+
+
+@app.post("/v1/messages", response_model=None)
+@with_error_injection
+async def anthropic_messages(
+    req: AnthropicMessagesRequest,
+    request: Request,
+) -> ORJSONResponse | StreamingResponse:
+    """Anthropic Messages endpoint."""
+    endpoint = "/v1/messages"
+    # The real API rejects requests without the anthropic-version header;
+    # enforce the same contract so header regressions fail against the mock.
+    if "anthropic-version" not in request.headers:
+        return ORJSONResponse(
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "anthropic-version header is required",
+                },
+            },
+            status_code=400,
+        )
+    init_model_config(req.model)
+    ctx = make_ctx(req, endpoint, request.state.start_time)
+    cache_triple = _anthropic_cache_triple(ctx, req)
+
+    if req.stream:
+        STREAMING_REQUESTS_TOTAL.labels(endpoint=endpoint, model=req.model).inc()
+        return StreamingResponse(
+            _anthropic_stream_wrapper(ctx, req, endpoint, cache_triple),
+            media_type="text/event-stream",
+        )
+
+    with track_llm_request(ctx, req.model, endpoint):
+        await ctx.latency_sim.wait_for_tokens(len(ctx.tokens))
+        response_data = _build_anthropic_response_data(ctx, req, cache_triple)
+        response_bytes = len(orjson.dumps(response_data))
+        record_request_bytes(endpoint, len(ctx.tokenized.text), response_bytes)
+        return ORJSONResponse(response_data)
+
+
+async def _anthropic_stream_wrapper(
+    ctx: RequestCtx,
+    req: AnthropicMessagesRequest,
+    endpoint: str,
+    cache_triple: tuple[int, int, int],
+):
+    """Wrapper for Anthropic streaming that records metrics after completion."""
+    async with async_track_llm_request(ctx, req.model, endpoint):
+        tool_use_block = _should_emit_tool_use(req)
+        async for chunk in stream_anthropic_messages(
+            ctx, endpoint, tool_use_block=tool_use_block, cache_triple=cache_triple
+        ):
+            yield chunk
+
+
+# ============================================================================
+# Text Completions
+# ============================================================================
+
+
+def _build_completion_response_data(ctx: RequestCtx) -> dict[str, Any]:
+    """Build non-streaming text completion response data."""
+    return {
+        "id": ctx.request_id,
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": ctx.model,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": ctx.finish_reason,
+                "text": ctx.content,
+            }
+        ],
+        "usage": ctx.usage,
+    }
+
+
+@app.post("/v1/completions", response_model=None)
+@with_error_injection
+async def completions(
+    req: CompletionRequest,
+    request: Request,
+) -> ORJSONResponse | StreamingResponse:
+    """Text completion endpoint."""
+    endpoint = "/v1/completions"
+    init_model_config(req.model)
+    ctx = make_ctx(req, endpoint, request.state.start_time)
+
+    if req.stream:
+        STREAMING_REQUESTS_TOTAL.labels(endpoint=endpoint, model=req.model).inc()
+        return StreamingResponse(
+            _text_stream_wrapper(ctx, req, endpoint),
+            media_type="text/event-stream",
+        )
+
+    with track_llm_request(ctx, req.model, endpoint):
+        await ctx.latency_sim.wait_for_tokens(len(ctx.tokens))
+        response_data = _build_completion_response_data(ctx)
+        response_bytes = len(orjson.dumps(response_data))
+        record_request_bytes(endpoint, len(ctx.tokenized.text), response_bytes)
+        return ORJSONResponse(response_data)
+
+
+async def _text_stream_wrapper(ctx: RequestCtx, req: CompletionRequest, endpoint: str):
+    """Wrapper for text streaming that records metrics after completion."""
+    async with async_track_llm_request(ctx, req.model, endpoint):
+        async for chunk in stream_text_completion(ctx, endpoint, req.include_usage):
+            yield chunk
+
+
+# ============================================================================
+# Responses
+# ============================================================================
+
+
+def _extract_responses_prompt(payload: dict[str, Any]) -> str:
+    input_value = payload.get("input", "")
+    if isinstance(input_value, str):
+        return input_value
+    if isinstance(input_value, list):
+        parts: list[str] = []
+        for item in input_value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    parts.extend(
+                        str(part.get("text", ""))
+                        for part in content
+                        if isinstance(part, dict)
+                    )
+        return "\n".join(part for part in parts if part)
+    return str(input_value)
+
+
+def _build_responses_response_data(ctx: RequestCtx) -> dict[str, Any]:
+    return {
+        "id": ctx.request_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": ctx.model,
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": ctx.content}],
+            }
+        ],
+        "output_text": ctx.content,
+        "usage": ctx.usage,
+    }
+
+
+@app.post("/v1/responses", response_model=None)
+@with_error_injection
+async def responses(req: dict[str, Any], request: Request) -> ORJSONResponse:
+    """Mock OpenAI Responses endpoint."""
+    endpoint = "/v1/responses"
+    model = str(req.get("model") or "test-model")
+    mock_req = ChatCompletionRequest(
+        model=model,
+        messages=[{"role": "user", "content": _extract_responses_prompt(req)}],
+    )
+    ctx = make_ctx(mock_req, endpoint, request.state.start_time)
+
+    with track_llm_request(ctx, model, endpoint):
+        await ctx.latency_sim.wait_for_tokens(len(ctx.tokens))
+        response_data = _build_responses_response_data(ctx)
+        record_request_bytes(
+            endpoint, len(ctx.tokenized.text), len(orjson.dumps(response_data))
+        )
+        return ORJSONResponse(response_data)
+
+
+# ============================================================================
+# Embeddings
+# ============================================================================
+
+
+async def _wait_for_processing(base_ms: float, per_unit_ms: float, units: int) -> None:
+    """Wait for processing based on base latency + per-unit latency."""
+    total_ms = base_ms + (per_unit_ms * units)
+    if total_ms > 0:
+        await asyncio.sleep(total_ms / 1000.0)
+
+
+def generate_embedding(text: str, dim: int = 768) -> list[float]:
+    """Generate deterministic embedding from text using stable hash.
+
+    Args:
+        text: Input text to generate embedding for.
+        dim: Embedding dimension (default 768).
+
+    Returns:
+        List of floats representing the embedding vector.
+    """
+    digest = hashlib.blake2s(text.encode("utf-8")).digest()
+    seed = int.from_bytes(digest, byteorder="big")
+    rng = random.Random(seed)
+    return [rng.random() - 0.5 for _ in range(dim)]
+
+
+def _build_embedding_response_data(
+    ctx: RequestCtx, inputs: list[str]
+) -> dict[str, Any]:
+    """Build embedding response data."""
+    return {
+        "object": "list",
+        "model": ctx.model,
+        "data": [
+            {
+                "object": "embedding",
+                "index": i,
+                "embedding": generate_embedding(text),
+            }
+            for i, text in enumerate(inputs)
+        ],
+        "usage": ctx.usage,
+    }
+
+
+def _extract_chat_embedding_inputs(req: ChatCompletionRequest) -> list[str]:
+    inputs: list[str] = []
+    for message in req.messages:
+        content = message.content
+        if isinstance(content, str):
+            inputs.append(content)
+            continue
+        text = "\n".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+        inputs.append(text)
+    return inputs or [""]
+
+
+@app.post("/v1/embeddings", response_model=None)
+@with_error_injection
+async def embeddings(req: EmbeddingRequest, request: Request) -> ORJSONResponse:
+    """Embedding endpoint."""
+    endpoint = "/v1/embeddings"
+    start_time = request.state.start_time
+    ctx = make_ctx(req, endpoint, start_time)
+
+    with track_request(endpoint, req.model):
+        await _wait_for_processing(
+            server_config.embedding_base_latency,
+            server_config.embedding_per_input_latency,
+            len(req.inputs),
+        )
+
+        record_embedding_success(
+            endpoint,
+            req.model,
+            ctx.usage["prompt_tokens"],
+            len(req.inputs),
+            perf_counter() - start_time,
+        )
+
+        return ORJSONResponse(_build_embedding_response_data(ctx, req.inputs))
+
+
+@app.post("/v1/chat/embeddings", response_model=None)
+@with_error_injection
+async def chat_embeddings(
+    req: ChatCompletionRequest, request: Request
+) -> ORJSONResponse:
+    """Chat-shaped embedding endpoint."""
+    endpoint = "/v1/chat/embeddings"
+    start_time = request.state.start_time
+    ctx = make_ctx(req, endpoint, start_time)
+    inputs = _extract_chat_embedding_inputs(req)
+
+    with track_request(endpoint, req.model):
+        await _wait_for_processing(
+            server_config.embedding_base_latency,
+            server_config.embedding_per_input_latency,
+            len(inputs),
+        )
+
+        record_embedding_success(
+            endpoint,
+            req.model,
+            ctx.usage["prompt_tokens"],
+            len(inputs),
+            perf_counter() - start_time,
+        )
+
+        return ORJSONResponse(_build_embedding_response_data(ctx, inputs))
+
+
+# ============================================================================
+# Rankings
+# ============================================================================
+
+
+def _compute_mock_score(query: str, passage: str) -> float:
+    """Compute deterministic mock relevance score for all ranking mocks."""
+    combined = f"{query}|{passage}"
+    digest = hashlib.blake2s(combined.encode("utf-8")).digest()
+    int_digest = int.from_bytes(digest, byteorder="big")
+    return (int_digest % 1000) / 1000.0
+
+
+def _compute_ranked_scores(query: str, passages: list[str]) -> list[tuple[int, float]]:
+    """Compute and sort mock scores for passages, returning (index, score) pairs."""
+    scores = [(i, _compute_mock_score(query, p)) for i, p in enumerate(passages)]
+    return sorted(scores, key=lambda x: x[1], reverse=True)
+
+
+RankingRequestT = RankingRequest | HFTEIRerankRequest | CohereRerankRequest
+
+
+async def _handle_ranking_request(
+    req: RankingRequestT, endpoint: str
+) -> tuple[RequestCtx, list[tuple[int, float]]]:
+    """Common ranking request handler. Returns context and sorted (index, score) pairs."""
+    start_time = perf_counter()
+    ctx = make_ctx(req, endpoint, start_time)
+
+    with track_request(endpoint, req.model):
+        ranked_scores = _compute_ranked_scores(req.query_text, req.passage_texts)
+
+        await _wait_for_processing(
+            server_config.ranking_base_latency,
+            server_config.ranking_per_passage_latency,
+            len(req.passage_texts),
+        )
+
+        record_ranking_success(
+            endpoint,
+            req.model,
+            ctx.usage["prompt_tokens"],
+            len(req.passage_texts),
+            perf_counter() - start_time,
+        )
+        return ctx, ranked_scores
+
+
+# ============================================================================
+# NIM Rankings Endpoint
+# ============================================================================
+
+
+def _build_nim_ranking_response_data(
+    ctx: RequestCtx, ranked_scores: list[tuple[int, float]]
+) -> dict[str, Any]:
+    """Build NIM /v1/ranking response data."""
+    return {
+        "id": ctx.request_id,
+        "object": "rankings",
+        "model": ctx.model,
+        "rankings": [{"index": i, "relevance_score": s} for i, s in ranked_scores],
+        "usage": ctx.usage,
+    }
+
+
+@app.post("/v1/ranking", response_model=None)
+@with_error_injection
+async def rankings(req: RankingRequest) -> ORJSONResponse:
+    """Mock NVIDIA NIM /v1/ranking endpoint."""
+    ctx, ranked_scores = await _handle_ranking_request(req, "/v1/ranking")
+    return ORJSONResponse(_build_nim_ranking_response_data(ctx, ranked_scores))
+
+
+# ============================================================================
+# HuggingFace TEI Rankings Endpoint
+# ============================================================================
+
+
+def _build_hf_tei_ranking_response_data(
+    _ctx: RequestCtx, ranked_scores: list[tuple[int, float]]
+) -> dict[str, Any]:
+    """Build HuggingFace TEI /rerank response data."""
+    return {"results": [{"index": i, "score": s} for i, s in ranked_scores]}
+
+
+@app.post("/rerank", response_model=None)
+@with_error_injection
+async def hf_tei_rerank(req: HFTEIRerankRequest) -> ORJSONResponse:
+    """Mock HuggingFace TEI /rerank endpoint."""
+    ctx, ranked_scores = await _handle_ranking_request(req, "/rerank")
+    return ORJSONResponse(_build_hf_tei_ranking_response_data(ctx, ranked_scores))
+
+
+# ============================================================================
+# Cohere Rankings Endpoint
+# ============================================================================
+
+
+def _build_cohere_ranking_response_data(
+    _ctx: RequestCtx, ranked_scores: list[tuple[int, float]]
+) -> dict[str, Any]:
+    """Build Cohere /v2/rerank response data."""
+    return {"results": [{"index": i, "relevance_score": s} for i, s in ranked_scores]}
+
+
+@app.post("/v2/rerank", response_model=None)
+@with_error_injection
+async def cohere_rerank(req: CohereRerankRequest) -> ORJSONResponse:
+    """Mock Cohere /v2/rerank endpoint."""
+    ctx, ranked_scores = await _handle_ranking_request(req, "/v2/rerank")
+    return ORJSONResponse(_build_cohere_ranking_response_data(ctx, ranked_scores))
+
+
+# ============================================================================
+# NIM Image Retrieval
+# ============================================================================
+
+BOUNDING_BOX_CATEGORIES = ["title", "table", "figure", "text", "header", "footer"]
+
+
+def _generate_bounding_boxes(image_url: str) -> dict[str, list[dict[str, float]]]:
+    """Generate deterministic bounding boxes from image URL using stable hash."""
+    digest = hashlib.blake2s(image_url.encode("utf-8")).digest()
+    seed = int.from_bytes(digest, byteorder="big")
+    rng = random.Random(seed)
+
+    num_boxes = rng.randint(1, 5)
+    boxes: dict[str, list[dict[str, float]]] = {}
+    for _ in range(num_boxes):
+        category = rng.choice(BOUNDING_BOX_CATEGORIES)
+        x_min = round(rng.uniform(0.0, 0.5), 4)
+        y_min = round(rng.uniform(0.0, 0.5), 4)
+        x_max = round(rng.uniform(x_min + 0.05, 1.0), 4)
+        y_max = round(rng.uniform(y_min + 0.05, 1.0), 4)
+        confidence = round(rng.uniform(0.7, 1.0), 4)
+        box = {
+            "x_min": x_min,
+            "y_min": y_min,
+            "x_max": x_max,
+            "y_max": y_max,
+            "confidence": confidence,
+        }
+        boxes.setdefault(category, []).append(box)
+    return boxes
+
+
+def _build_image_retrieval_response_data(
+    req: ImageRetrievalRequest,
+) -> dict[str, Any]:
+    """Build NIM image retrieval response data."""
+    data = []
+    total_size_mb = 0.0
+    for i, img_input in enumerate(req.input):
+        bounding_boxes = _generate_bounding_boxes(img_input.url)
+        data.append({"index": i, "bounding_boxes": bounding_boxes})
+        # Estimate image size from base64 URL length
+        total_size_mb += len(img_input.url) / (1024 * 1024 * 1.37)
+
+    return {
+        "data": data,
+        "usage": {"images_size_mb": round(total_size_mb, 4)},
+    }
+
+
+@app.post("/v1/infer", response_model=None)
+@app.post("/v1/image/infer", response_model=None)
+@with_error_injection
+async def image_retrieval(req: ImageRetrievalRequest) -> ORJSONResponse:
+    """Mock NIM Image Retrieval endpoint."""
+    endpoint = "/v1/infer"
+    start_time = perf_counter()
+    num_images = len(req.input)
+
+    with track_request(endpoint, "image-retrieval"):
+        await _wait_for_processing(
+            server_config.image_retrieval_base_latency,
+            server_config.image_retrieval_per_image_latency,
+            num_images,
+        )
+
+        record_image_retrieval_success(
+            endpoint,
+            num_images,
+            perf_counter() - start_time,
+        )
+
+        return ORJSONResponse(_build_image_retrieval_response_data(req))
+
+
+# ============================================================================
+# Custom Multimodal Endpoint
+# ============================================================================
+
+
+@app.post("/v1/custom-multimodal", response_model=None)
+@with_error_injection
+async def custom_multimodal(req: dict, request: Request) -> dict:
+    """Mock endpoint with custom multi-modal format."""
+    endpoint = "/v1/custom-multimodal"
+    inference_params = req.get("inference_params", {})
+    model_id = inference_params.get("model_id", "default-model")
+
+    # Parse multimodal input
+    bundle = req.get("modality_bundle", {})
+    text_fragments = bundle.get("text_fragments", [])
+    visual_assets = bundle.get("visual_assets", {})
+    images = visual_assets.get("images", [])
+    videos = visual_assets.get("videos", [])
+    audio_streams = bundle.get("audio_streams", [])
+
+    # Create mock chat request for LLM simulation
+    text_content = " ".join(text_fragments) if text_fragments else "default text"
+    mock_req = ChatCompletionRequest(
+        model=model_id or "default-model",
+        messages=[{"role": "user", "content": text_content}],
+    )
+    ctx = make_ctx(mock_req, endpoint, request.state.start_time)
+
+    with track_llm_request(ctx, mock_req.model, endpoint):
+        await ctx.latency_sim.wait_for_tokens(len(ctx.tokens))
+
+        response_text = f"Processed {len(text_fragments)} text fragments"
+        if images:
+            response_text += f", {len(images)} images"
+        if videos:
+            response_text += f", {len(videos)} videos"
+        if audio_streams:
+            response_text += f", {len(audio_streams)} audio streams"
+
+        return {
+            "text": response_text,
+            "completion": {
+                "generated_text": response_text,
+                "metadata": {
+                    "tokens_used": {
+                        "input": ctx.usage["prompt_tokens"],
+                        "output": ctx.usage["completion_tokens"],
+                        "total": ctx.usage["total_tokens"],
+                    }
+                },
+            },
+        }
+
+
+# ============================================================================
+# HuggingFace Generate Endpoint
+# ============================================================================
+
+
+def _build_tgi_response_data(ctx: RequestCtx) -> dict[str, Any]:
+    """Build non-streaming TGI /generate response."""
+    return {"generated_text": ctx.content}
+
+
+@app.post("/generate", response_model=None)
+@with_error_injection
+async def huggingface_generate(
+    req: TGIGenerateRequest, request: Request
+) -> ORJSONResponse:
+    """Mock HuggingFace TGI /generate endpoint (non-streaming)."""
+    endpoint = "/generate"
+    start_time = request.state.start_time
+    ctx = make_ctx(req, endpoint, start_time)
+
+    with track_request(endpoint, req.model):
+        await ctx.latency_sim.wait_for_tokens(len(ctx.tokens))
+        record_tgi_success(endpoint, ctx.usage, perf_counter() - start_time)
+        return ORJSONResponse(_build_tgi_response_data(ctx))
+
+
+@app.post("/generate_stream", response_model=None)
+@with_error_injection
+async def huggingface_generate_stream(req: TGIGenerateRequest, request: Request):
+    """Mock HuggingFace TGI /generate_stream endpoint (streaming)."""
+    endpoint = "/generate_stream"
+    start_time = request.state.start_time
+    ctx = make_ctx(req, endpoint, start_time)
+    STREAMING_REQUESTS_TOTAL.labels(endpoint=endpoint, model=req.model).inc()
+    return StreamingResponse(
+        _tgi_stream_wrapper(ctx, endpoint, start_time),
+        media_type="text/event-stream",
+    )
+
+
+async def _tgi_stream_wrapper(ctx: RequestCtx, endpoint: str, start_time: float):
+    """Wrapper for TGI streaming that records metrics after completion."""
+    async with async_track_request(endpoint, ctx.model):
+        async for chunk in stream_tgi_completion(ctx, endpoint):
+            yield chunk
+        record_tgi_success(endpoint, ctx.usage, perf_counter() - start_time)
+
+
+# ============================================================================
+# Video Generation
+# ============================================================================
+
+
+async def _read_video_payload(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "")
+    if (
+        "multipart/form-data" in content_type
+        or "application/x-www-form-urlencoded" in content_type
+    ):
+        form = await request.form()
+        return dict(form.multi_items())
+    payload = await request.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def _video_response_data(
+    video_id: str, request: Request, model: str = "test-model"
+) -> dict[str, Any]:
+    content_url = str(request.base_url).rstrip("/") + f"/v1/videos/{video_id}/content"
+    now = int(time.time())
+    return {
+        "id": video_id,
+        "object": "video",
+        "status": "completed",
+        "progress": 100,
+        "url": content_url,
+        "model": model,
+        "created_at": now,
+        "completed_at": now,
+        "inference_time_s": 0.0,
+    }
+
+
+@app.post("/v1/videos", response_model=None)
+@with_error_injection
+async def video_generation(request: Request) -> ORJSONResponse:
+    """Mock OpenAI/SGLang video generation submit endpoint."""
+    payload = await _read_video_payload(request)
+    model = str(payload.get("model") or "test-model")
+    prompt = str(payload.get("prompt") or "")
+    digest = hashlib.blake2s(prompt.encode("utf-8"), digest_size=6).hexdigest()
+    video_id = f"video-{digest}"
+    return ORJSONResponse(_video_response_data(video_id, request, model))
+
+
+@app.get("/v1/videos/{video_id}", response_model=None)
+async def video_generation_status(video_id: str, request: Request) -> ORJSONResponse:
+    """Mock OpenAI/SGLang video generation polling endpoint."""
+    return ORJSONResponse(_video_response_data(video_id, request))
+
+
+@app.get("/v1/videos/{video_id}/content", response_model=None)
+async def video_generation_content(video_id: str) -> Response:
+    """Mock OpenAI/SGLang video generation content endpoint."""
+    return Response(
+        content=f"mock-video:{video_id}".encode(),
+        media_type="application/octet-stream",
+    )
+
+
+# ============================================================================
+# Image Generation
+# ============================================================================
+
+
+def _generate_mock_jpeg_b64(prompt: str, index: int = 0) -> str:
+    """Generate deterministic mock base64 JPEG image from prompt.
+
+    Creates a minimal valid JPEG file that can be decoded by standard
+    image libraries. The image content is deterministically generated
+    based on the prompt.
+    """
+    combined = f"{prompt}|{index}"
+    digest = hashlib.blake2s(combined.encode("utf-8")).digest()
+
+    # Create a minimal valid JPEG (1x1 pixel)
+    jpeg_data = b"\xff\xd8"  # SOI (Start of Image)
+    jpeg_data += b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"  # JFIF
+    jpeg_data += b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"  # SOF0
+    jpeg_data += (
+        b"\xff\xc4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x09"
+    )  # DHT
+    jpeg_data += (
+        b"\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00"
+    )  # DHT
+    jpeg_data += b"\xff\xdb\x00\x43\x00" + digest[:64]  # DQT (deterministic)
+    jpeg_data += b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00" + digest[64:80]  # SOS
+    jpeg_data += b"\xff\xd9"  # EOI (End of Image)
+
+    return base64.b64encode(jpeg_data).decode("utf-8")
+
+
+def _build_image_response_data(
+    ctx: RequestCtx, req: ImageGenerationRequest
+) -> dict[str, Any]:
+    """Build non-streaming image generation response."""
+    data = []
+    for i in range(req.n):
+        image_data: dict[str, Any] = {
+            "b64_json": _generate_mock_jpeg_b64(req.prompt, i)
+        }
+        if req.response_format == "url":
+            image_data["url"] = f"https://mock.image.url/{i}"
+        data.append(image_data)
+
+    response_data: dict[str, Any] = {"created": int(time.time()), "data": data}
+
+    if req.size:
+        response_data["size"] = req.size
+    if req.quality:
+        response_data["quality"] = req.quality
+    if req.style:
+        response_data["style"] = req.style
+
+    response_data["usage"] = ctx.usage
+    return response_data
+
+
+@app.post("/v1/images/generations", response_model=None)
+@with_error_injection
+async def image_generation(
+    req: ImageGenerationRequest, request: Request
+) -> ORJSONResponse | StreamingResponse:
+    """Mock OpenAI Image Generation endpoint.
+
+    Supports both streaming and non-streaming responses.
+    Returns deterministic base64-encoded JPEG images.
+    """
+    endpoint = "/v1/images/generations"
+    start_time = request.state.start_time
+    mock_req = ChatCompletionRequest(
+        model=req.model, messages=[{"role": "user", "content": req.prompt}]
+    )
+    ctx = make_ctx(mock_req, endpoint, start_time)
+
+    if req.stream:
+        STREAMING_REQUESTS_TOTAL.labels(endpoint=endpoint, model=req.model).inc()
+
+        async def image_stream():
+            async with async_track_llm_request(ctx, req.model, endpoint):
+                for i in range(req.n):
+                    await ctx.latency_sim.wait_for_tokens(len(ctx.tokens) // req.n)
+                    chunk = {
+                        "b64_json": _generate_mock_jpeg_b64(req.prompt, i),
+                        "partial_image_index": i,
+                    }
+                    if req.size:
+                        chunk["size"] = req.size
+                    if req.quality:
+                        chunk["quality"] = req.quality
+                    yield b"data: " + orjson.dumps(chunk) + b"\n\n"
+                yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(image_stream(), media_type="text/event-stream")
+
+    with track_llm_request(ctx, req.model, endpoint):
+        await ctx.latency_sim.wait_for_tokens(len(ctx.tokens))
+        return ORJSONResponse(_build_image_response_data(ctx, req))
+
+
+# Each parameter calls Form/File fresh so FastAPI builds an independent
+# FieldInfo per parameter (alias resolution, validators, etc.) — sharing a
+# single instance across multiple parameters lets state leak between them.
+# B008 is the FastAPI-idiomatic exception to "no function calls in defaults".
+@app.post("/v1/images/edits", response_model=None)
+@with_error_injection
+async def image_edits(
+    request: Request,
+    prompt: str = Form(...),  # noqa: B008
+    image: UploadFile | None = File(None),  # noqa: B008
+    url: str | None = Form(None),  # noqa: B008
+    model: str = Form("mock-model"),  # noqa: B008
+    n: int = Form(1),  # noqa: B008
+    response_format: str = Form("b64_json"),  # noqa: B008
+    size: str | None = Form(None),  # noqa: B008
+    num_inference_steps: int | None = Form(None),  # noqa: B008
+    guidance_scale: float | None = Form(None),  # noqa: B008
+    true_cfg_scale: float | None = Form(None),  # noqa: B008
+    seed: int | None = Form(None),  # noqa: B008
+) -> ORJSONResponse:
+    """Mock OpenAI Image Edit endpoint.
+
+    Drains the uploaded image so multipart parsing is exercised, then
+    returns a deterministic b64-encoded JPEG.
+    """
+    endpoint = "/v1/images/edits"
+    if image is None and not url:
+        raise HTTPException(
+            status_code=422, detail="Field 'image' or 'url' is required"
+        )
+
+    if image is not None:
+        upload_bytes = await image.read()
+        upload_size = len(upload_bytes)
+    else:
+        upload_size = 0
+
+    start_time = request.state.start_time
+    mock_req = ChatCompletionRequest(
+        model=model, messages=[{"role": "user", "content": prompt}]
+    )
+    ctx = make_ctx(mock_req, endpoint, start_time)
+
+    img_req = ImageGenerationRequest(
+        prompt=prompt,
+        model=model,
+        n=n,
+        response_format=response_format,
+        size=size,
+    )
+
+    with track_llm_request(ctx, model, endpoint):
+        await ctx.latency_sim.wait_for_tokens(len(ctx.tokens))
+        body = _build_image_response_data(ctx, img_req)
+        body["input_image_bytes"] = upload_size
+        if num_inference_steps is not None:
+            body["num_inference_steps"] = num_inference_steps
+        if guidance_scale is not None:
+            body["guidance_scale"] = guidance_scale
+        if true_cfg_scale is not None:
+            body["true_cfg_scale"] = true_cfg_scale
+        if seed is not None:
+            body["seed"] = seed
+        return ORJSONResponse(body)
+
+
+# ============================================================================
+# SOLIDO RAG
+# ============================================================================
+
+
+def _build_solido_rag_response_data(
+    ctx: RequestCtx, req: SolidoRAGRequest
+) -> dict[str, Any]:
+    """Build SOLIDO RAG response data."""
+    query_text = " ".join(req.query)
+    sources = []
+    num_sources = min(3, len(req.query))
+    for i in range(num_sources):
+        source_hash = hashlib.blake2s(f"{query_text}|source{i}".encode()).hexdigest()[
+            :8
+        ]
+        sources.append(
+            {
+                "id": f"doc_{source_hash}",
+                "title": f"Document {i + 1}",
+                "score": 0.9 - (i * 0.1),
+                "content": f"Source content for query: {query_text[:50]}...",
+            }
+        )
+    return {
+        "content": ctx.content,
+        "sources": sources,
+        "filters": req.filters,
+        "inference_model": req.inference_model,
+    }
+
+
+@app.post("/rag/api/prompt", response_model=None)
+@with_error_injection
+async def solido_rag(req: SolidoRAGRequest, request: Request) -> ORJSONResponse:
+    """Mock SOLIDO RAG endpoint.
+
+    Processes RAG queries with filters and returns generated content with sources.
+    """
+    endpoint = "/rag/api/prompt"
+    start_time = request.state.start_time
+
+    # Create mock chat request for token counting and timing
+    query_text = " ".join(req.query)
+    mock_req = ChatCompletionRequest(
+        model=req.inference_model,
+        messages=[{"role": "user", "content": query_text}],
+    )
+    ctx = make_ctx(mock_req, endpoint, start_time)
+
+    with track_llm_request(ctx, req.inference_model, endpoint):
+        await ctx.latency_sim.wait_for_tokens(len(ctx.tokens))
+        return ORJSONResponse(_build_solido_rag_response_data(ctx, req))
+
+
+# ============================================================================
+# Health & Info
+# ============================================================================
+
+
+@app.get("/health")
+async def health():
+    """Health check."""
+    return {"status": "healthy", "config": public_config_dump(server_config)}
+
+
+@app.get("/v1/models")
+async def list_models() -> dict[str, Any]:
+    """OpenAI-compatible models list. Respects models_ready_delay_seconds and
+    disable_models_endpoint so readiness-probe tests can exercise all branches
+    (immediate success, success after retries, 404 fallback, timeout)."""
+    if server_config.disable_models_endpoint:
+        raise HTTPException(status_code=404, detail="Not Found")
+    elapsed = time.time() - server_start_time if server_start_time > 0 else 0.0
+    if elapsed < server_config.models_ready_delay_seconds:
+        return {"object": "list", "data": []}
+    return {
+        "object": "list",
+        "data": [{"id": server_config.default_model, "object": "model"}],
+    }
+
+
+@app.get("/")
+async def root():
+    """Root info."""
+    return {
+        "message": "AIPerf Mock Server",
+        "version": "2.0.0",
+        "config": public_config_dump(server_config),
+    }
+
+
+# ============================================================================
+# DCGM Metrics
+# ============================================================================
+
+
+@app.get("/dcgm{instance_id:int}/metrics")
+async def dcgm_metrics(instance_id: int) -> PlainTextResponse:
+    """DCGM metrics endpoint (Prometheus format)."""
+    index = instance_id - 1
+    if index < 0 or index >= len(dcgm_fakers):
+        raise HTTPException(status_code=404, detail="Invalid DCGM instance")
+    return PlainTextResponse(dcgm_fakers[index].generate(), media_type="text/plain")
+
+
+# ============================================================================
+# Prometheus Metrics Endpoints
+# ============================================================================
+
+
+@app.get("/metrics")
+async def prometheus_metrics() -> Response:
+    """AIPerf mock server Prometheus metrics endpoint.
+
+    Returns AIPerf mock server specific metrics:
+    - Request counts by endpoint, method, and status
+    - Request latency histograms
+    - Token counts (prompt/completion) by endpoint and model
+    - Streaming metrics (tokens streamed, TTFT, ITL)
+    - In-flight request gauges
+    - Error counts by type
+    - Server uptime
+    """
+    # Update uptime on each scrape
+    if server_start_time > 0:
+        SERVER_UPTIME_SECONDS.set(time.time() - server_start_time)
+    return metrics_response(AIPERF_MOCK_REGISTRY)
+
+
+@app.get("/node_exporter/metrics")
+async def node_exporter_metrics() -> Response:
+    """Fake node-exporter Prometheus metrics endpoint.
+
+    Emits an exposition body similar to a real node-exporter scrape, covering
+    every metric type AIPerf handles (gauge, counter, histogram, summary) plus
+    multiple `# TYPE foo untyped` families and one family with no `# TYPE`
+    declaration at all. Values drift per scrape so derived stats are non-zero.
+    """
+    return Response(content=render_node_exporter(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/vllm/metrics")
+async def vllm_metrics() -> Response:
+    """vLLM-compatible Prometheus metrics endpoint.
+
+    Returns metrics matching vLLM server format:
+    - vllm:e2e_request_latency_seconds
+    - vllm:time_to_first_token_seconds
+    - vllm:inter_token_latency_seconds
+    - vllm:prompt_tokens, vllm:generation_tokens
+    - vllm:num_requests_running, vllm:num_requests_waiting
+    - vllm:request_success, vllm:request_queue_time_seconds
+    """
+    return metrics_response(VLLM_REGISTRY)
+
+
+@app.get("/sglang/metrics")
+async def sglang_metrics() -> Response:
+    """SGLang-compatible Prometheus metrics endpoint.
+
+    Returns metrics matching SGLang server format:
+    - sglang:e2e_request_latency_seconds
+    - sglang:time_to_first_token_seconds
+    - sglang:queue_time_seconds
+    - sglang:num_running_reqs, sglang:num_queue_reqs
+    - sglang:gen_throughput, sglang:cache_hit_rate
+    """
+    return metrics_response(SGLANG_REGISTRY)
+
+
+@app.get("/trtllm/metrics")
+async def trtllm_metrics() -> Response:
+    """TensorRT-LLM-compatible Prometheus metrics endpoint.
+
+    Returns metrics matching TensorRT-LLM server format:
+    - trtllm:e2e_request_latency_seconds
+    - trtllm:time_to_first_token_seconds
+    - trtllm:time_per_output_token_seconds
+    - trtllm:request_queue_time_seconds
+    - trtllm:request_success
+    """
+    return metrics_response(TRTLLM_REGISTRY)
+
+
+@app.get("/dynamo_frontend/metrics")
+async def dynamo_frontend_metrics() -> Response:
+    """Dynamo frontend Prometheus metrics endpoint.
+
+    Returns metrics matching Dynamo frontend format:
+    - dynamo_frontend_request_duration_seconds
+    - dynamo_frontend_time_to_first_token_seconds
+    - dynamo_frontend_inter_token_latency_seconds
+    - dynamo_frontend_requests
+    - dynamo_frontend_input_sequence_tokens, dynamo_frontend_output_tokens
+    - dynamo_frontend_queued_requests, dynamo_frontend_inflight_requests
+    """
+    return metrics_response(DYNAMO_FRONTEND_REGISTRY)
+
+
+@app.get("/dynamo_component/prefill/metrics")
+async def dynamo_prefill_metrics() -> Response:
+    """Dynamo prefill worker Prometheus metrics endpoint.
+
+    Returns metrics matching Dynamo component format for prefill workers:
+    - dynamo_component_request_duration_seconds
+    - dynamo_component_requests
+    - dynamo_component_inflight_requests
+    - dynamo_component_kvstats_* (KV cache stats)
+    """
+    return metrics_response(DYNAMO_PREFILL_REGISTRY)
+
+
+@app.get("/dynamo_component/decode/metrics")
+async def dynamo_decode_metrics() -> Response:
+    """Dynamo decode worker Prometheus metrics endpoint.
+
+    Returns metrics matching Dynamo component format for decode workers:
+    - dynamo_component_request_duration_seconds
+    - dynamo_component_requests
+    - dynamo_component_inflight_requests
+    - dynamo_component_kvstats_* (KV cache stats)
+    """
+    return metrics_response(DYNAMO_DECODE_REGISTRY)

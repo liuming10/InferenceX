@@ -1,0 +1,1703 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Tests for data loading functionality.
+"""
+
+from pathlib import Path
+from typing import Any
+
+import orjson
+import pandas as pd
+import pytest
+
+from aiperf.plot.core.data_loader import DataLoader, RunData, RunMetadata
+from aiperf.plot.exceptions import DataLoadError
+
+
+class TestDataLoaderLoadRun:
+    """Tests for DataLoader.load_run method."""
+
+    def test_load_single_run_success(self, single_run_dir: Path) -> None:
+        """Test successfully loading a single run."""
+        loader = DataLoader()
+        run = loader.load_run(single_run_dir)
+
+        assert isinstance(run, RunData)
+        assert isinstance(run.metadata, RunMetadata)
+        assert isinstance(run.requests, pd.DataFrame)
+        assert isinstance(run.aggregated, dict)
+
+        # Check that requests were loaded
+        assert len(run.requests) == 10
+        assert "time_to_first_token" in run.requests.columns
+        assert "request_latency" in run.requests.columns
+
+    def test_load_run_reads_slice_duration_from_artifacts_config(
+        self,
+        tmp_path: Path,
+        sample_jsonl_data: list[dict[str, Any]],
+        sample_aggregated_data: dict[str, Any],
+    ) -> None:
+        """Test loading slice_duration from the v2 artifacts config shape."""
+        run_dir = tmp_path / "test_run"
+        run_dir.mkdir()
+
+        jsonl_lines = [
+            orjson.dumps(record).decode("utf-8") for record in sample_jsonl_data
+        ]
+        (run_dir / "profile_export.jsonl").write_text("\n".join(jsonl_lines) + "\n")
+
+        input_config = {
+            **sample_aggregated_data["input_config"],
+            "artifacts": {"slice_duration": 60.0},
+        }
+        aggregated = {**sample_aggregated_data, "input_config": input_config}
+        (run_dir / "profile_export_aiperf.json").write_bytes(orjson.dumps(aggregated))
+
+        run = DataLoader().load_run(run_dir)
+
+        assert run.slice_duration == 60.0
+
+    def test_load_run_nonexistent_path(self, tmp_path: Path) -> None:
+        """Test loading from nonexistent path raises error.
+
+        Uses ``tmp_path / "nonexistent" / "path"`` instead of a hard-coded
+        ``"/nonexistent/path"`` so the path is guaranteed not to exist on
+        every platform. (On Windows, ``Path("/nonexistent/path")`` can
+        resolve to drive-relative paths whose parents may exist as
+        directories on the test machine, causing the ``is_dir()`` /
+        ``exists()`` checks in ``load_run`` to take an unexpected branch.)
+        """
+        loader = DataLoader()
+        fake_path = tmp_path / "nonexistent" / "path"
+
+        with pytest.raises(DataLoadError, match="does not exist"):
+            loader.load_run(fake_path)
+
+    def test_load_run_file_path(self, tmp_path: Path) -> None:
+        """Test loading from file path raises error."""
+        loader = DataLoader()
+        file_path = tmp_path / "test.txt"
+        file_path.write_text("test")
+
+        with pytest.raises(DataLoadError, match="not a directory"):
+            loader.load_run(file_path)
+
+    def test_load_run_missing_jsonl(self, tmp_path: Path) -> None:
+        """Test loading run without JSONL file raises error."""
+        loader = DataLoader()
+        run_dir = tmp_path / "incomplete_run"
+        run_dir.mkdir()
+
+        with pytest.raises(DataLoadError, match="JSONL file not found"):
+            loader.load_run(run_dir)
+
+    def test_metadata_extraction(self, single_run_dir: Path) -> None:
+        """Test that metadata is correctly extracted."""
+        loader = DataLoader()
+        run = loader.load_run(single_run_dir)
+
+        assert run.metadata.run_name == single_run_dir.name
+        assert run.metadata.run_path == single_run_dir
+        assert run.metadata.model == "Qwen/Qwen3-0.6B"
+        assert run.metadata.concurrency == 1
+        assert run.metadata.request_count == 64
+        assert run.metadata.endpoint_type == "chat"
+
+    def test_timestamp_columns_remain_as_integers(self, single_run_dir: Path) -> None:
+        """Test that timestamp columns remain as integer nanoseconds."""
+        loader = DataLoader()
+        run = loader.load_run(single_run_dir)
+
+        # Check that timestamp columns are numeric integers (nanoseconds)
+        assert pd.api.types.is_numeric_dtype(run.requests["request_start_ns"])
+        assert pd.api.types.is_numeric_dtype(run.requests["request_end_ns"])
+        # Verify they contain nanosecond values (large integers)
+        assert run.requests["request_start_ns"].min() > 1e18
+
+
+class TestDataLoaderLoadMultipleRuns:
+    """Tests for DataLoader.load_multiple_runs method."""
+
+    def test_load_multiple_runs_success(self, multiple_run_dirs: list[Path]) -> None:
+        """Test successfully loading multiple runs."""
+        loader = DataLoader()
+        runs = loader.load_multiple_runs(multiple_run_dirs)
+
+        assert len(runs) == 2
+        assert all(isinstance(r, RunData) for r in runs)
+
+    def test_load_empty_list_raises_error(self) -> None:
+        """Test that empty run list raises error."""
+        loader = DataLoader()
+
+        with pytest.raises(DataLoadError, match="No run paths provided"):
+            loader.load_multiple_runs([])
+
+    def test_load_with_invalid_run_raises_error(
+        self, single_run_dir: Path, tmp_path: Path
+    ) -> None:
+        """Test that invalid run in list raises error."""
+        loader = DataLoader()
+        invalid_dir = tmp_path / "invalid"
+        invalid_dir.mkdir()
+
+        with pytest.raises(DataLoadError):
+            loader.load_multiple_runs([single_run_dir, invalid_dir])
+
+
+class TestDataLoaderLoadJsonl:
+    """Tests for DataLoader._load_jsonl method."""
+
+    def test_load_valid_jsonl(self, single_run_dir: Path) -> None:
+        """Test loading valid JSONL file."""
+        loader = DataLoader()
+        jsonl_path = single_run_dir / "profile_export.jsonl"
+        df = loader._load_jsonl(jsonl_path)
+
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) == 10
+        assert "time_to_first_token" in df.columns
+        assert "session_num" in df.columns
+
+    def test_load_jsonl_missing_file(self, tmp_path: Path) -> None:
+        """Test loading nonexistent JSONL file raises error."""
+        loader = DataLoader()
+        fake_path = tmp_path / "nonexistent.jsonl"
+
+        with pytest.raises(DataLoadError, match="JSONL file not found"):
+            loader._load_jsonl(fake_path)
+
+    def test_load_jsonl_with_corrupted_lines(self, tmp_path: Path) -> None:
+        """Test loading JSONL with corrupted lines."""
+        loader = DataLoader()
+        jsonl_path = tmp_path / "corrupted.jsonl"
+
+        # Write JSONL with two good lines and one bad line
+        with open(jsonl_path, "w") as f:
+            f.write(
+                orjson.dumps(
+                    {
+                        "metadata": {
+                            "session_num": 0,
+                            "request_start_ns": 1000000000,
+                            "request_end_ns": 1500000000,
+                            "worker_id": "worker-0",
+                            "record_processor_id": "processor-0",
+                            "benchmark_phase": "profiling",
+                        },
+                        "metrics": {
+                            "time_to_first_token": {"value": 45.0, "unit": "ms"}
+                        },
+                    }
+                ).decode("utf-8")
+                + "\n"
+            )
+            f.write("{ invalid json }\n")
+            f.write(
+                orjson.dumps(
+                    {
+                        "metadata": {
+                            "session_num": 1,
+                            "request_start_ns": 2000000000,
+                            "request_end_ns": 2500000000,
+                            "worker_id": "worker-0",
+                            "record_processor_id": "processor-0",
+                            "benchmark_phase": "profiling",
+                        },
+                        "metrics": {
+                            "time_to_first_token": {"value": 50.0, "unit": "ms"}
+                        },
+                    }
+                ).decode("utf-8")
+                + "\n"
+            )
+
+        df = loader._load_jsonl(jsonl_path)
+        # Should load 2 valid records, skip 1 corrupted
+        assert len(df) == 2
+
+    def test_load_jsonl_empty_file_raises_error(self, tmp_path: Path) -> None:
+        """Test loading empty JSONL file raises error."""
+        loader = DataLoader()
+        jsonl_path = tmp_path / "empty.jsonl"
+        jsonl_path.write_text("")
+
+        with pytest.raises(DataLoadError, match="No valid records found"):
+            loader._load_jsonl(jsonl_path)
+
+
+class TestDataLoaderComputeInterChunkLatencyStats:
+    """Tests for DataLoader._compute_inter_chunk_latency_stats method."""
+
+    def test_compute_stats_with_valid_data(self) -> None:
+        """Test computing statistics from valid inter_chunk_latency data."""
+        values = [10.0, 20.0, 30.0, 40.0, 50.0]
+        stats = DataLoader._compute_inter_chunk_latency_stats(values)
+
+        assert "inter_chunk_latency_avg" in stats
+        assert "inter_chunk_latency_p50" in stats
+        assert "inter_chunk_latency_p95" in stats
+        assert "inter_chunk_latency_std" in stats
+        assert "inter_chunk_latency_min" in stats
+        assert "inter_chunk_latency_max" in stats
+        assert "inter_chunk_latency_range" in stats
+
+        # Verify computed values
+        assert stats["inter_chunk_latency_avg"] == 30.0
+        assert stats["inter_chunk_latency_p50"] == 30.0
+        assert stats["inter_chunk_latency_min"] == 10.0
+        assert stats["inter_chunk_latency_max"] == 50.0
+        assert stats["inter_chunk_latency_range"] == 40.0
+
+    def test_compute_stats_with_empty_array(self) -> None:
+        """Test that empty array returns empty dict."""
+        stats = DataLoader._compute_inter_chunk_latency_stats([])
+        assert stats == {}
+
+    def test_compute_stats_with_single_value(self) -> None:
+        """Test computing statistics from single value."""
+        values = [25.0]
+        stats = DataLoader._compute_inter_chunk_latency_stats(values)
+
+        assert stats["inter_chunk_latency_avg"] == 25.0
+        assert stats["inter_chunk_latency_p50"] == 25.0
+        assert stats["inter_chunk_latency_min"] == 25.0
+        assert stats["inter_chunk_latency_max"] == 25.0
+        assert stats["inter_chunk_latency_range"] == 0.0
+        assert stats["inter_chunk_latency_std"] == 0.0
+
+    def test_compute_stats_with_jitter(self) -> None:
+        """Test statistics capture jitter/variance in stream health."""
+        # Stable stream
+        stable_values = [20.0, 20.0, 20.0, 20.0, 20.0]
+        stable_stats = DataLoader._compute_inter_chunk_latency_stats(stable_values)
+
+        # Jittery stream with spike
+        jittery_values = [10.0, 10.0, 10.0, 50.0, 10.0]
+        jittery_stats = DataLoader._compute_inter_chunk_latency_stats(jittery_values)
+
+        # Stable stream should have zero std and range
+        assert stable_stats["inter_chunk_latency_std"] == 0.0
+        assert stable_stats["inter_chunk_latency_range"] == 0.0
+
+        # Jittery stream should have higher std and range
+        assert jittery_stats["inter_chunk_latency_std"] > 0.0
+        assert jittery_stats["inter_chunk_latency_range"] == 40.0
+        assert jittery_stats["inter_chunk_latency_max"] == 50.0
+
+
+class TestDataLoaderLoadAggregatedJson:
+    """Tests for DataLoader._load_aggregated_json method."""
+
+    def test_load_valid_aggregated_json(self, single_run_dir: Path) -> None:
+        """Test loading valid aggregated JSON."""
+        loader = DataLoader()
+        json_path = single_run_dir / "profile_export_aiperf.json"
+        data = loader._load_aggregated_json(json_path)
+
+        assert isinstance(data, dict)
+        assert "input_config" in data
+
+    def test_load_missing_aggregated_json(self, tmp_path: Path) -> None:
+        """Test loading missing aggregated JSON raises DataLoadError."""
+        loader = DataLoader()
+        fake_path = tmp_path / "nonexistent.json"
+
+        with pytest.raises(DataLoadError, match="JSON file not found"):
+            loader._load_aggregated_json(fake_path)
+
+    def test_load_invalid_json(self, tmp_path: Path) -> None:
+        """Test loading invalid JSON raises DataLoadError."""
+        loader = DataLoader()
+        json_path = tmp_path / "invalid.json"
+        json_path.write_text("{ invalid json }")
+
+        with pytest.raises(DataLoadError, match="Failed to parse JSON"):
+            loader._load_aggregated_json(json_path)
+
+
+class TestDataLoaderExtractMetadata:
+    """Tests for DataLoader._extract_metadata method."""
+
+    def test_extract_metadata_with_all_data(
+        self, tmp_path: Path, sample_aggregated_data: dict[str, Any]
+    ) -> None:
+        """Test metadata extraction with complete data."""
+        loader = DataLoader()
+        run_path = tmp_path / "test_run"
+        requests_df = pd.DataFrame(
+            {
+                "request_start_ns": pd.to_datetime(
+                    [1000000000, 2000000000], unit="ns", utc=True
+                ),
+                "request_end_ns": pd.to_datetime(
+                    [1500000000, 2500000000], unit="ns", utc=True
+                ),
+            }
+        )
+
+        metadata = loader._extract_metadata(
+            run_path, requests_df, sample_aggregated_data
+        )
+
+        assert metadata.run_name == "test_run"
+        assert metadata.run_path == run_path
+        assert metadata.model == "test-model"
+        assert metadata.concurrency == 4
+        assert metadata.request_count == 100
+        assert metadata.endpoint_type == "chat"
+        assert metadata.duration_seconds is not None
+
+    def test_extract_metadata_missing_aggregated_data(self, tmp_path: Path) -> None:
+        """Test metadata extraction without aggregated data."""
+        loader = DataLoader()
+        run_path = tmp_path / "test_run"
+        requests_df = pd.DataFrame()
+
+        metadata = loader._extract_metadata(run_path, requests_df, {})
+
+        assert metadata.run_name == "test_run"
+        assert metadata.model is None
+        assert metadata.concurrency is None
+
+    def test_extract_metadata_model_from_yaml_v2_models_items(
+        self, tmp_path: Path
+    ) -> None:
+        """YAML v2 stores model name at input_config.models.items[].name."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "models": {"items": [{"name": "Qwen/Qwen3-0.6B"}]},
+                "loadgen": {"concurrency": 5},
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.model == "Qwen/Qwen3-0.6B"
+
+    def test_extract_metadata_model_yaml_v2_takes_precedence(
+        self, tmp_path: Path
+    ) -> None:
+        """When both YAML v2 and legacy shapes are present, YAML v2 wins."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "models": {"items": [{"name": "yaml-v2-model"}]},
+                "endpoint": {"model_names": ["legacy-model"]},
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.model == "yaml-v2-model"
+
+    def test_extract_metadata_model_from_legacy_endpoint_model_names(
+        self, tmp_path: Path
+    ) -> None:
+        """Legacy artifacts without models.items still resolve via endpoint.model_names."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "endpoint": {"model_names": ["legacy-model"]},
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.model == "legacy-model"
+
+    def test_extract_metadata_model_empty_yaml_v2_items_falls_back_to_legacy(
+        self, tmp_path: Path
+    ) -> None:
+        """Empty/malformed models.items must not shadow a valid legacy entry."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "models": {"items": []},
+                "endpoint": {"model_names": ["legacy-model"]},
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.model == "legacy-model"
+
+    def test_extract_metadata_model_from_aggregate_metadata_block(
+        self, tmp_path: Path
+    ) -> None:
+        """Aggregate-only runs carry no input_config; model is stamped onto
+        ``aggregated["metadata"]["model"]`` by the sweep exporter."""
+        loader = DataLoader()
+        aggregated = {
+            "metadata": {
+                "aggregation_type": "confidence",
+                "model": "Qwen/Qwen3-0.6B",
+                "variation_label": "concurrency_10",
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.model == "Qwen/Qwen3-0.6B"
+
+    def test_extract_metadata_input_config_model_takes_precedence_over_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        """When both shapes carry a model, the input_config value wins because
+        per-trial artifacts are richer and the metadata-block stamp is a
+        fallback for aggregate-only runs."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "endpoint": {"model_names": ["from-input-config"]},
+            },
+            "metadata": {"model": "from-aggregate-metadata"},
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.model == "from-input-config"
+
+    def test_extract_metadata_concurrency_from_yaml_v2_phases(
+        self, tmp_path: Path
+    ) -> None:
+        """YAML v2 stores concurrency on the profiling phase, not on loadgen."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "loadgen": None,
+                "phases": [
+                    {"name": "profiling", "concurrency": 15, "requests": 200},
+                ],
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.concurrency == 15
+        assert metadata.request_count == 200
+
+    def test_extract_metadata_concurrency_yaml_v2_prefers_profiling_phase(
+        self, tmp_path: Path
+    ) -> None:
+        """When multiple phases exist, the profiling phase wins over warmup."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "phases": [
+                    {"name": "warmup", "concurrency": 1, "requests": 10},
+                    {"name": "profiling", "concurrency": 25, "requests": 500},
+                ],
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.concurrency == 25
+        assert metadata.request_count == 500
+
+    def test_extract_metadata_concurrency_yaml_v2_takes_precedence_over_legacy(
+        self, tmp_path: Path
+    ) -> None:
+        """Mirror the model-name precedence: v2 phases win when both shapes are present."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "loadgen": {"concurrency": 1, "request_count": 1},
+                "phases": [{"name": "profiling", "concurrency": 42, "requests": 99}],
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.concurrency == 42
+        assert metadata.request_count == 99
+
+    def test_extract_metadata_concurrency_from_legacy_loadgen(
+        self, tmp_path: Path
+    ) -> None:
+        """Legacy artifacts with no phases still resolve via loadgen."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "loadgen": {"concurrency": 8, "request_count": 64},
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.concurrency == 8
+        assert metadata.request_count == 64
+
+    def test_extract_metadata_concurrency_handles_null_loadgen(
+        self, tmp_path: Path
+    ) -> None:
+        """``loadgen: null`` in v2 artifacts must not crash the lookup."""
+        loader = DataLoader()
+        aggregated = {
+            "input_config": {
+                "loadgen": None,
+                "phases": [],
+            },
+        }
+
+        metadata = loader._extract_metadata(tmp_path / "run", None, aggregated)
+
+        assert metadata.concurrency is None
+        assert metadata.request_count is None
+
+
+class TestDataLoaderReloadWithDetails:
+    """Tests for DataLoader.reload_with_details method."""
+
+    def test_reload_adds_per_request_data(self, single_run_dir: Path) -> None:
+        """Test that reload_with_details loads per-request data."""
+        loader = DataLoader()
+        run = loader.load_run(single_run_dir, load_per_request_data=False)
+
+        assert run.requests is None
+
+        reloaded_run = loader.reload_with_details(single_run_dir)
+
+        assert reloaded_run.requests is not None
+        assert not reloaded_run.requests.empty
+        assert reloaded_run.metadata.run_name == run.metadata.run_name
+        assert reloaded_run.metadata.model == run.metadata.model
+        assert reloaded_run.metadata.concurrency == run.metadata.concurrency
+        assert reloaded_run.aggregated == run.aggregated
+
+    def test_reload_nonexistent_path_raises_error(self, tmp_path: Path) -> None:
+        """Test reload_with_details with nonexistent path."""
+        loader = DataLoader()
+        fake_path = tmp_path / "nonexistent_run"
+
+        with pytest.raises(DataLoadError, match="Run path does not exist"):
+            loader.reload_with_details(fake_path)
+
+
+class TestDataLoaderLoadPerRequestData:
+    """Tests for DataLoader.load_run with load_per_request_data parameter."""
+
+    def test_load_run_without_per_request_data(self, single_run_dir: Path) -> None:
+        """Test loading run without per-request data."""
+        loader = DataLoader()
+        run = loader.load_run(single_run_dir, load_per_request_data=False)
+
+        assert run.metadata is not None
+        assert run.aggregated is not None
+        assert run.requests is None
+
+    def test_load_run_with_per_request_data(self, single_run_dir: Path) -> None:
+        """Test loading run with per-request data."""
+        loader = DataLoader()
+        run = loader.load_run(single_run_dir, load_per_request_data=True)
+
+        assert run.metadata is not None
+        assert run.aggregated is not None
+        assert run.requests is not None
+        assert not run.requests.empty
+
+    def test_load_without_per_request_data_missing_jsonl_raises_error(
+        self, tmp_path: Path, sample_aggregated_data: dict[str, Any]
+    ) -> None:
+        """Test that load_per_request_data=False still validates JSONL exists."""
+        run_dir = tmp_path / "test_run"
+        run_dir.mkdir()
+
+        json_path = run_dir / "profile_export_aiperf.json"
+        json_path.write_bytes(orjson.dumps(sample_aggregated_data))
+
+        loader = DataLoader()
+        with pytest.raises(DataLoadError, match="Required JSONL file not found"):
+            loader.load_run(run_dir, load_per_request_data=False)
+
+
+class TestDataLoaderDurationCalculation:
+    """Tests for duration calculation in metadata extraction."""
+
+    def test_duration_calculated_from_requests(self, tmp_path: Path) -> None:
+        """Test duration is calculated from request timestamps."""
+        loader = DataLoader()
+        run_path = tmp_path / "test_run"
+
+        requests_df = pd.DataFrame(
+            {
+                "request_start_ns": pd.to_datetime(
+                    [1000000000, 1500000000, 2000000000], unit="ns", utc=True
+                ),
+                "request_end_ns": pd.to_datetime(
+                    [1200000000, 1700000000, 3000000000], unit="ns", utc=True
+                ),
+            }
+        )
+
+        metadata = loader._extract_metadata(run_path, requests_df, {})
+
+        assert metadata.duration_seconds is not None
+        assert metadata.duration_seconds == 2.0
+
+    def test_duration_none_when_no_requests(self, tmp_path: Path) -> None:
+        """Test duration is None when no request data available."""
+        loader = DataLoader()
+        run_path = tmp_path / "test_run"
+
+        metadata = loader._extract_metadata(run_path, None, {})
+
+        assert metadata.duration_seconds is None
+
+    def test_duration_none_when_empty_dataframe(self, tmp_path: Path) -> None:
+        """Test duration is None with empty DataFrame."""
+        loader = DataLoader()
+        run_path = tmp_path / "test_run"
+        requests_df = pd.DataFrame()
+
+        metadata = loader._extract_metadata(run_path, requests_df, {})
+
+        assert metadata.duration_seconds is None
+
+    def test_duration_with_missing_timestamp_columns(self, tmp_path: Path) -> None:
+        """Test duration is None when timestamp columns are missing."""
+        loader = DataLoader()
+        run_path = tmp_path / "test_run"
+        requests_df = pd.DataFrame({"other_column": [1, 2, 3]})
+
+        metadata = loader._extract_metadata(run_path, requests_df, {})
+
+        assert metadata.duration_seconds is None
+
+
+class TestDataLoaderExtractTelemetry:
+    """Tests for DataLoader.extract_telemetry_data method."""
+
+    def test_extract_telemetry_with_valid_data(self) -> None:
+        """Test extracting telemetry data from valid aggregated data."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {
+                    "start_time": "2025-01-01T00:00:00",
+                    "end_time": "2025-01-01T01:00:00",
+                },
+                "endpoints": {
+                    "endpoint1": {"gpus": {"0": {}, "1": {}}},
+                },
+            }
+        }
+
+        result = loader.extract_telemetry_data(aggregated)
+
+        assert result is not None
+        assert "summary" in result
+        assert "endpoints" in result
+        assert len(result["endpoints"]) == 1
+
+    def test_extract_telemetry_missing_data(self) -> None:
+        """Test extracting telemetry when data is missing."""
+        loader = DataLoader()
+        aggregated = {"other_field": "value"}
+
+        result = loader.extract_telemetry_data(aggregated)
+
+        assert result is None
+
+    def test_extract_telemetry_empty_aggregated(self) -> None:
+        """Test extracting telemetry from empty aggregated dict."""
+        loader = DataLoader()
+        aggregated = {}
+
+        result = loader.extract_telemetry_data(aggregated)
+
+        assert result is None
+
+    def test_extract_telemetry_wrong_structure(self) -> None:
+        """Test extracting telemetry with wrong data structure."""
+        loader = DataLoader()
+        aggregated = {"telemetry_data": "not a dict"}
+
+        result = loader.extract_telemetry_data(aggregated)
+
+        assert result is None
+
+    def test_extract_telemetry_missing_summary_key(self) -> None:
+        """Test extracting telemetry when summary key is missing."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "endpoints": {"endpoint1": {}},
+            }
+        }
+
+        result = loader.extract_telemetry_data(aggregated)
+
+        assert result is None
+
+    def test_extract_telemetry_missing_endpoints_key(self) -> None:
+        """Test extracting telemetry when endpoints key is missing."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {"start_time": "2025-01-01T00:00:00"},
+            }
+        }
+
+        result = loader.extract_telemetry_data(aggregated)
+
+        assert result is None
+
+    def test_extract_telemetry_empty_endpoints(self) -> None:
+        """Test extracting telemetry with empty endpoints dict."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {"start_time": "2025-01-01T00:00:00"},
+                "endpoints": {},
+            }
+        }
+
+        result = loader.extract_telemetry_data(aggregated)
+
+        # Should be valid even with empty endpoints
+        assert result is not None
+        assert result["endpoints"] == {}
+
+
+class TestDataLoaderGetTelemetrySummary:
+    """Tests for DataLoader.get_telemetry_summary method."""
+
+    def test_get_telemetry_summary_valid(self) -> None:
+        """Test getting telemetry summary from valid data."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {
+                    "start_time": "2025-01-01T00:00:00",
+                    "end_time": "2025-01-01T01:00:00",
+                    "endpoints_configured": 2,
+                    "endpoints_successful": 2,
+                },
+                "endpoints": {},
+            }
+        }
+
+        result = loader.get_telemetry_summary(aggregated)
+
+        assert result is not None
+        assert result["start_time"] == "2025-01-01T00:00:00"
+        assert result["end_time"] == "2025-01-01T01:00:00"
+
+    def test_get_telemetry_summary_no_telemetry(self) -> None:
+        """Test getting telemetry summary when no telemetry data exists."""
+        loader = DataLoader()
+        aggregated = {}
+
+        result = loader.get_telemetry_summary(aggregated)
+
+        assert result is None
+
+
+class TestDataLoaderCalculateGPUCount:
+    """Tests for DataLoader.calculate_gpu_count_from_telemetry method."""
+
+    def test_calculate_gpu_count_single_endpoint(self) -> None:
+        """Test calculating GPU count from single endpoint."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": {
+                    "endpoint1": {
+                        "gpus": {
+                            "0": {"gpu_index": 0},
+                            "1": {"gpu_index": 1},
+                            "2": {"gpu_index": 2},
+                        }
+                    },
+                },
+            }
+        }
+
+        result = loader.calculate_gpu_count_from_telemetry(aggregated)
+
+        assert result == 3
+
+    def test_calculate_gpu_count_multiple_endpoints(self) -> None:
+        """Test calculating GPU count from multiple endpoints."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": {
+                    "endpoint1": {
+                        "gpus": {
+                            "0": {},
+                            "1": {},
+                        }
+                    },
+                    "endpoint2": {
+                        "gpus": {
+                            "0": {},
+                            "1": {},
+                            "2": {},
+                        }
+                    },
+                },
+            }
+        }
+
+        result = loader.calculate_gpu_count_from_telemetry(aggregated)
+
+        assert result == 5
+
+    def test_calculate_gpu_count_no_telemetry(self) -> None:
+        """Test calculating GPU count when no telemetry data exists."""
+        loader = DataLoader()
+        aggregated = {}
+
+        result = loader.calculate_gpu_count_from_telemetry(aggregated)
+
+        assert result is None
+
+    def test_calculate_gpu_count_zero_gpus(self) -> None:
+        """Test calculating GPU count when endpoints have no GPUs."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": {
+                    "endpoint1": {"gpus": {}},
+                },
+            }
+        }
+
+        result = loader.calculate_gpu_count_from_telemetry(aggregated)
+
+        assert result is None
+
+    def test_calculate_gpu_count_invalid_endpoints_structure(self) -> None:
+        """Test calculating GPU count with invalid endpoints structure."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": "not a dict",
+            }
+        }
+
+        result = loader.calculate_gpu_count_from_telemetry(aggregated)
+
+        assert result is None
+
+    def test_calculate_gpu_count_invalid_endpoint_data(self) -> None:
+        """Test calculating GPU count when endpoint data is not a dict."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": {
+                    "endpoint1": "not a dict",
+                    "endpoint2": {"gpus": {"0": {}, "1": {}}},
+                },
+            }
+        }
+
+        result = loader.calculate_gpu_count_from_telemetry(aggregated)
+
+        # Should count GPUs from valid endpoint only
+        assert result == 2
+
+    def test_calculate_gpu_count_missing_gpus_key(self) -> None:
+        """Test calculating GPU count when gpus key is missing."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": {
+                    "endpoint1": {"other_field": "value"},
+                },
+            }
+        }
+
+        result = loader.calculate_gpu_count_from_telemetry(aggregated)
+
+        assert result is None
+
+    def test_calculate_gpu_count_gpus_not_dict(self) -> None:
+        """Test calculating GPU count when gpus field is not a dict."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": {
+                    "endpoint1": {"gpus": "not a dict"},
+                },
+            }
+        }
+
+        result = loader.calculate_gpu_count_from_telemetry(aggregated)
+
+        assert result is None
+
+
+class TestDataLoaderAddDerivedMetrics:
+    """Tests for DataLoader._add_all_derived_metrics method."""
+
+    def test_add_derived_metrics_with_telemetry(self) -> None:
+        """Test adding derived metrics when telemetry data is available."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": {
+                    "endpoint1": {
+                        "gpus": {"0": {}, "1": {}},
+                    }
+                },
+            },
+            "output_token_throughput": {"value": 1000.0, "unit": "tokens/s"},
+        }
+
+        loader._add_all_derived_metrics(aggregated)
+
+        # Should have added per-GPU metric
+        assert "output_token_throughput_per_gpu" in aggregated
+        assert aggregated["output_token_throughput_per_gpu"]["value"] == 500.0
+        assert aggregated["output_token_throughput_per_gpu"]["unit"] == "tokens/sec/gpu"
+
+    def test_add_derived_metrics_no_telemetry(self) -> None:
+        """Test adding derived metrics when no telemetry data exists."""
+        loader = DataLoader()
+        aggregated = {
+            "output_token_throughput": {"value": 1000.0, "unit": "tokens/s"},
+        }
+
+        loader._add_all_derived_metrics(aggregated)
+
+        # Should not add per-GPU metrics without telemetry
+        assert "output_token_throughput_per_gpu" not in aggregated
+
+    def test_add_derived_metrics_zero_gpus(self) -> None:
+        """Test adding derived metrics when GPU count is zero."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": {
+                    "endpoint1": {"gpus": {}},
+                },
+            },
+            "output_token_throughput": {"value": 1000.0, "unit": "tokens/s"},
+        }
+
+        loader._add_all_derived_metrics(aggregated)
+
+        # Should not add per-GPU metrics with zero GPUs
+        assert "output_token_throughput_per_gpu" not in aggregated
+
+    def test_add_derived_metrics_missing_base_metric(self) -> None:
+        """Test adding derived metrics when base metric is missing."""
+        loader = DataLoader()
+        aggregated = {
+            "telemetry_data": {
+                "summary": {},
+                "endpoints": {
+                    "endpoint1": {"gpus": {"0": {}, "1": {}}},
+                },
+            },
+            # Missing output_token_throughput
+        }
+
+        loader._add_all_derived_metrics(aggregated)
+
+        # Should handle gracefully - derived metric won't be added
+        assert "output_token_throughput_per_gpu" not in aggregated
+
+
+class TestDataLoaderGetAvailableMetrics:
+    """Tests for DataLoader.get_available_metrics method."""
+
+    def test_get_available_metrics_with_data(self, tmp_path: Path) -> None:
+        """Test getting available metrics from loaded run."""
+        loader = DataLoader()
+        aggregated = {
+            "time_to_first_token": {"value": 45.0, "unit": "ms"},
+            "inter_token_latency": {"value": 20.0, "unit": "ms"},
+            "request_latency": {"value": 500.0, "unit": "ms"},
+        }
+
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated=aggregated,
+        )
+
+        result = loader.get_available_metrics(run_data)
+
+        assert "display_names" in result
+        assert "units" in result
+        assert len(result["display_names"]) == 3
+        assert len(result["units"]) == 3
+        assert "time_to_first_token" in result["display_names"]
+        assert result["units"]["time_to_first_token"] == "ms"
+
+    def test_get_available_metrics_no_aggregated_data(self, tmp_path: Path) -> None:
+        """Test getting available metrics when no aggregated data exists."""
+        loader = DataLoader()
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated={},
+        )
+
+        result = loader.get_available_metrics(run_data)
+
+        assert result["display_names"] == {}
+        assert result["units"] == {}
+
+    def test_get_available_metrics_filters_non_metrics(self, tmp_path: Path) -> None:
+        """Test that non-metric keys are filtered out."""
+        loader = DataLoader()
+        aggregated = {
+            "time_to_first_token": {"value": 45.0, "unit": "ms"},
+            "input_config": {"some": "config"},  # Should be filtered
+            "was_cancelled": False,  # Should be filtered
+            "error_summary": [],  # Should be filtered
+        }
+
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated=aggregated,
+        )
+
+        result = loader.get_available_metrics(run_data)
+
+        assert "time_to_first_token" in result["display_names"]
+        assert "input_config" not in result["display_names"]
+        assert "was_cancelled" not in result["display_names"]
+        assert "error_summary" not in result["display_names"]
+
+    def test_get_available_metrics_handles_non_dict_values(
+        self, tmp_path: Path
+    ) -> None:
+        """Test that non-dict values are skipped."""
+        loader = DataLoader()
+        aggregated = {
+            "time_to_first_token": {"value": 45.0, "unit": "ms"},
+            "some_string": "value",
+            "some_number": 123,
+            "some_list": [1, 2, 3],
+        }
+
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated=aggregated,
+        )
+
+        result = loader.get_available_metrics(run_data)
+
+        assert "time_to_first_token" in result["display_names"]
+        assert "some_string" not in result["display_names"]
+        assert "some_number" not in result["display_names"]
+        assert "some_list" not in result["display_names"]
+
+    def test_get_available_metrics_requires_unit_field(self, tmp_path: Path) -> None:
+        """Test that metrics without unit field are skipped."""
+        loader = DataLoader()
+        aggregated = {
+            "time_to_first_token": {"value": 45.0, "unit": "ms"},
+            "metric_without_unit": {"value": 100.0},
+        }
+
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated=aggregated,
+        )
+
+        result = loader.get_available_metrics(run_data)
+
+        assert "time_to_first_token" in result["display_names"]
+        assert "metric_without_unit" not in result["display_names"]
+
+
+class TestDataLoaderLoadRunWithGPUTelemetry:
+    """Tests for DataLoader.load_run method with GPU telemetry data."""
+
+    def test_load_run_includes_gpu_telemetry(self, single_run_dir: Path) -> None:
+        """Test that load_run successfully loads GPU telemetry data from real fixtures."""
+        loader = DataLoader()
+        run = loader.load_run(single_run_dir)
+
+        assert run.gpu_telemetry is not None
+        assert isinstance(run.gpu_telemetry, pd.DataFrame)
+        assert len(run.gpu_telemetry) > 0
+
+        # Verify timestamp_s column exists with relative timestamps
+        # Note: timestamps can be negative if GPU telemetry started before first request
+        assert "timestamp_s" in run.gpu_telemetry.columns
+        assert pd.api.types.is_numeric_dtype(run.gpu_telemetry["timestamp_s"])
+
+        # Verify rich telemetry fields from real data
+        expected_fields = [
+            "gpu_index",
+            "nvidia_gpu_utilization",
+            "nvidia_power_usage",
+            "nvidia_memory_used",
+            "nvidia_temperature",
+            "sm_clock_frequency",
+            "memory_clock_frequency",
+            "telemetry_source_url",
+            "gpu_uuid",
+            "hostname",
+        ]
+        for field in expected_fields:
+            assert field in run.gpu_telemetry.columns, f"Missing field: {field}"
+
+
+class TestDataLoaderLoadGPUTelemetryJSONL:
+    """Tests for DataLoader._load_gpu_telemetry_jsonl method."""
+
+    def test_load_gpu_telemetry_with_relative_timestamps(
+        self, single_run_dir: Path
+    ) -> None:
+        """Test loading GPU telemetry with relative timestamp conversion using real data."""
+        loader = DataLoader()
+        jsonl_path = single_run_dir / "gpu_telemetry_export.jsonl"
+
+        run_start_time_ns = 1762551530946074466
+
+        df = loader._load_gpu_telemetry_jsonl(jsonl_path, run_start_time_ns)
+
+        assert df is not None
+        assert len(df) > 0
+        assert "timestamp_s" in df.columns
+        assert "nvidia_gpu_utilization" in df.columns
+        assert "nvidia_power_usage" in df.columns
+        assert "nvidia_memory_used" in df.columns
+        assert "nvidia_temperature" in df.columns
+
+        # Check relative timestamp conversion
+        # Note: First timestamp can be negative if telemetry started before first request
+        assert pd.api.types.is_numeric_dtype(df["timestamp_s"])
+        # Timestamps should be monotonically increasing
+        assert df["timestamp_s"].is_monotonic_increasing
+
+    def test_load_gpu_telemetry_with_absolute_timestamps(
+        self, single_run_dir: Path
+    ) -> None:
+        """Test loading GPU telemetry with absolute timestamps (no run start time) using real data."""
+        loader = DataLoader()
+        jsonl_path = single_run_dir / "gpu_telemetry_export.jsonl"
+
+        df = loader._load_gpu_telemetry_jsonl(jsonl_path, run_start_time_ns=None)
+
+        assert df is not None
+        assert len(df) > 0
+        assert "timestamp_s" in df.columns
+        # Check absolute timestamp in seconds (should be large value)
+        assert df["timestamp_s"].iloc[0] > 1e9
+
+    def test_load_gpu_telemetry_missing_file(self, tmp_path: Path) -> None:
+        """Test loading GPU telemetry when file doesn't exist."""
+        loader = DataLoader()
+        jsonl_path = tmp_path / "nonexistent.jsonl"
+
+        df = loader._load_gpu_telemetry_jsonl(jsonl_path)
+
+        assert df is None
+
+    def test_load_gpu_telemetry_corrupted_lines(self, tmp_path: Path) -> None:
+        """Test loading GPU telemetry with corrupted lines."""
+        loader = DataLoader()
+        jsonl_path = tmp_path / "gpu_telemetry_export.jsonl"
+
+        with open(jsonl_path, "w") as f:
+            f.write(
+                orjson.dumps(
+                    {
+                        "timestamp_ns": 1000000000000,
+                        "gpu_index": 0,
+                        "telemetry_data": {"gpu_utilization": 80.5},
+                    }
+                ).decode("utf-8")
+                + "\n"
+            )
+            f.write("{ invalid json }\n")
+            f.write(
+                orjson.dumps(
+                    {
+                        "timestamp_ns": 1000000100000,
+                        "gpu_index": 1,
+                        "telemetry_data": {"gpu_utilization": 75.0},
+                    }
+                ).decode("utf-8")
+                + "\n"
+            )
+
+        df = loader._load_gpu_telemetry_jsonl(jsonl_path)
+
+        # Should load 2 valid records, skip 1 corrupted
+        assert df is not None
+        assert len(df) == 2
+
+    def test_load_gpu_telemetry_empty_file(self, tmp_path: Path) -> None:
+        """Test loading GPU telemetry from empty file."""
+        loader = DataLoader()
+        jsonl_path = tmp_path / "gpu_telemetry_export.jsonl"
+        jsonl_path.write_text("")
+
+        df = loader._load_gpu_telemetry_jsonl(jsonl_path)
+
+        assert df is None
+
+    def test_load_gpu_telemetry_missing_timestamp_field(self, tmp_path: Path) -> None:
+        """Test loading GPU telemetry when timestamp_ns field is missing."""
+        loader = DataLoader()
+        jsonl_path = tmp_path / "gpu_telemetry_export.jsonl"
+
+        telemetry_data = [
+            {
+                "gpu_index": 0,
+                "telemetry_data": {"gpu_utilization": 80.5},
+                # Missing timestamp_ns
+            },
+        ]
+
+        with open(jsonl_path, "w") as f:
+            for record in telemetry_data:
+                f.write(orjson.dumps(record).decode("utf-8") + "\n")
+
+        df = loader._load_gpu_telemetry_jsonl(jsonl_path)
+
+        # Should still load, but timestamp_s won't be present
+        assert df is not None
+        assert len(df) == 1
+        assert "gpu_index" in df.columns
+
+    def test_load_gpu_telemetry_flattens_nested_data(
+        self, single_run_dir: Path
+    ) -> None:
+        """Test that telemetry_data dict is flattened into main record using real data."""
+        loader = DataLoader()
+        jsonl_path = single_run_dir / "gpu_telemetry_export.jsonl"
+
+        df = loader._load_gpu_telemetry_jsonl(jsonl_path)
+
+        assert df is not None
+        assert len(df) > 0
+
+        # Verify top-level metadata fields are present
+        assert "timestamp_ns" in df.columns
+        assert "gpu_index" in df.columns
+        assert "telemetry_source_url" in df.columns
+        assert "gpu_uuid" in df.columns
+        assert "hostname" in df.columns
+
+        # Verify telemetry_data fields are flattened to top level
+        assert "nvidia_gpu_utilization" in df.columns
+        assert "nvidia_power_usage" in df.columns
+        assert "nvidia_memory_used" in df.columns
+        assert "nvidia_temperature" in df.columns
+        assert "sm_clock_frequency" in df.columns
+        assert "memory_clock_frequency" in df.columns
+
+        # telemetry_data should not be a nested column
+        assert "telemetry_data" not in df.columns
+
+
+class TestRunDataGetMetric:
+    """Tests for RunData.get_metric method."""
+
+    def test_get_metric_from_nested_metrics_dict(self, tmp_path: Path) -> None:
+        """Test getting metric from nested 'metrics' structure with dict."""
+        aggregated = {
+            "metrics": {
+                "time_to_first_token": {"avg": 45.0, "unit": "ms", "std": 5.0},
+                "request_latency": {"avg": 500.0, "unit": "ms", "std": 50.0},
+            }
+        }
+
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated=aggregated,
+        )
+
+        metric = run_data.get_metric("time_to_first_token")
+        assert metric is not None
+        assert metric["avg"] == 45.0
+        assert metric["unit"] == "ms"
+        assert metric["std"] == 5.0
+
+    def test_get_metric_from_flat_structure_dict(self, tmp_path: Path) -> None:
+        """Test getting metric from flat top-level structure with dict."""
+        aggregated = {
+            "time_to_first_token": {"avg": 45.0, "unit": "ms", "std": 5.0},
+            "request_latency": {"avg": 500.0, "unit": "ms", "std": 50.0},
+            "input_config": {"some": "config"},
+        }
+
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated=aggregated,
+        )
+
+        metric = run_data.get_metric("time_to_first_token")
+        assert metric is not None
+        assert metric["avg"] == 45.0
+        assert metric["unit"] == "ms"
+
+    def test_get_metric_returns_none_for_missing_metric(self, tmp_path: Path) -> None:
+        """Test that get_metric returns None for metric that doesn't exist."""
+        aggregated = {
+            "time_to_first_token": {"avg": 45.0, "unit": "ms"},
+        }
+
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated=aggregated,
+        )
+
+        metric = run_data.get_metric("nonexistent_metric")
+        assert metric is None
+
+    def test_get_metric_returns_none_for_empty_aggregated(self, tmp_path: Path) -> None:
+        """Test that get_metric returns None when aggregated is empty."""
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated={},
+        )
+
+        metric = run_data.get_metric("time_to_first_token")
+        assert metric is None
+
+    def test_get_metric_prefers_nested_metrics_over_flat(self, tmp_path: Path) -> None:
+        """Test that nested 'metrics' structure is preferred over flat when both exist."""
+        aggregated = {
+            "time_to_first_token": {"avg": 100.0, "unit": "ms"},
+            "metrics": {
+                "time_to_first_token": {"avg": 45.0, "unit": "ms", "std": 5.0},
+            },
+        }
+
+        run_data = RunData(
+            metadata=RunMetadata(
+                run_name="test", run_path=tmp_path, duration_seconds=None
+            ),
+            requests=None,
+            aggregated=aggregated,
+        )
+
+        metric = run_data.get_metric("time_to_first_token")
+        assert metric is not None
+        assert metric["avg"] == 45.0
+
+    def test_get_metric_handles_metric_result_objects(
+        self, single_run_dir: Path
+    ) -> None:
+        """Test get_metric with MetricResult objects from real data."""
+        loader = DataLoader()
+        run = loader.load_run(single_run_dir)
+
+        if "metrics" in run.aggregated:
+            metric = run.get_metric("time_to_first_token")
+            assert metric is not None
+            assert hasattr(metric, "avg") or "avg" in metric
+
+
+class TestDataLoaderAggregateOnly:
+    """Tests for ``DataLoader.load_run`` on per-cell confidence-aggregate dirs.
+
+    These dirs hold ``profile_export_aiperf_aggregate.json`` only (no
+    JSONL, because aggregates carry no per-request events). The loader
+    un-flattens flat ``{metric}_{stat}`` keys into the single-run
+    nested-by-stat shape so the rest of the plot pipeline stays
+    uniform.
+    """
+
+    def _write_aggregate_dir(
+        self, dir_path: Path, *, concurrency: int, throughput: float, p99: float
+    ) -> Path:
+        """Write a minimal per-cell aggregate JSON and return the dir."""
+        dir_path.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": "1.0",
+            "aiperf_version": "test",
+            "metadata": {
+                "aggregation_type": "confidence",
+                "num_profile_runs": 3,
+                "num_successful_runs": 3,
+                "variation_label": f"concurrency_{concurrency}",
+                "variation_values": {"phases.profiling.concurrency": concurrency},
+            },
+            "metrics": {
+                "output_token_throughput_avg": {
+                    "mean": throughput,
+                    "std": 0.5,
+                    "ci_low": throughput - 0.4,
+                    "ci_high": throughput + 0.4,
+                    "unit": "tokens/sec",
+                },
+                "request_latency_p99": {
+                    "mean": p99,
+                    "std": 1.0,
+                    "ci_low": p99 - 0.5,
+                    "ci_high": p99 + 0.5,
+                    "unit": "ms",
+                },
+                "request_latency_avg": {
+                    "mean": p99 * 0.4,
+                    "std": 0.2,
+                    "ci_low": 0.0,
+                    "ci_high": 0.0,
+                    "unit": "ms",
+                },
+            },
+        }
+        (dir_path / "profile_export_aiperf_aggregate.json").write_bytes(
+            orjson.dumps(payload)
+        )
+        return dir_path
+
+    def test_loads_aggregate_only_dir_returning_run_data(self, tmp_path: Path) -> None:
+        """``load_run`` on an aggregate-only dir returns RunData."""
+        cell = self._write_aggregate_dir(
+            tmp_path / "concurrency_10", concurrency=10, throughput=42.0, p99=24.0
+        )
+
+        run = DataLoader().load_run(cell)
+
+        assert isinstance(run, RunData)
+        assert run.requests is None
+        assert run.timeslices is None
+        assert run.gpu_telemetry is None
+        assert run.server_metrics is None
+        assert isinstance(run.metadata, RunMetadata)
+
+    def test_unflattens_flat_metric_stat_keys_to_nested_shape(
+        self, tmp_path: Path
+    ) -> None:
+        """Flat ``request_latency_p99`` re-emerges as ``request_latency.p99``."""
+        cell = self._write_aggregate_dir(
+            tmp_path / "concurrency_10", concurrency=10, throughput=42.0, p99=24.0
+        )
+
+        run = DataLoader().load_run(cell)
+
+        latency = run.get_metric("request_latency")
+        assert latency is not None, (
+            "request_latency should be reconstructed from *_p99 / *_avg"
+        )
+        assert getattr(latency, "p99", None) == 24.0
+        assert getattr(latency, "avg", None) == 24.0 * 0.4
+        assert getattr(latency, "unit", None) == "ms"
+
+        throughput = run.get_metric("output_token_throughput")
+        assert throughput is not None
+        assert getattr(throughput, "avg", None) == 42.0
+        assert getattr(throughput, "unit", None) == "tokens/sec"
+
+    def test_extracts_concurrency_from_variation_values(self, tmp_path: Path) -> None:
+        """Aggregate metadata's ``variation_values`` populates concurrency.
+
+        The aggregate file does not carry an ``input_config`` block (the
+        single-run JSON does), so without this fallback the dashboard
+        would lose the variation identity. Documents the wiring from
+        ``variation_values["phases.profiling.concurrency"]`` →
+        ``RunMetadata.concurrency``.
+        """
+        cell = self._write_aggregate_dir(
+            tmp_path / "concurrency_42", concurrency=42, throughput=100.0, p99=10.0
+        )
+
+        run = DataLoader().load_run(cell)
+
+        assert run.metadata.concurrency == 42
+
+    def test_aggregate_only_does_not_require_jsonl(self, tmp_path: Path) -> None:
+        """No JSONL on disk → aggregate path is taken without raising."""
+        cell = self._write_aggregate_dir(
+            tmp_path / "concurrency_10", concurrency=10, throughput=42.0, p99=24.0
+        )
+        assert not (cell / "profile_export.jsonl").exists()
+
+        # Should not raise "Required JSONL file not found".
+        DataLoader().load_run(cell)
+
+    def test_unrecognized_stat_suffix_buckets_under_avg(self, tmp_path: Path) -> None:
+        """Keys whose tail is not a known stat fall back to ``avg``.
+
+        Documents the fallback contract in
+        ``DataLoader._unflatten_confidence_metrics``: keys whose right
+        side (after the last underscore) is not in
+        ``_KNOWN_STAT_SUFFIXES`` are treated as a metric name with no
+        stat suffix and bucketed under ``avg``. Keeps unknown shapes
+        visible rather than dropping them.
+        """
+        cell = tmp_path / "concurrency_10"
+        cell.mkdir()
+        (cell / "profile_export_aiperf_aggregate.json").write_bytes(
+            orjson.dumps(
+                {
+                    "metadata": {"aggregation_type": "confidence"},
+                    "metrics": {
+                        "weird_metric_unknown": {"mean": 7.0, "unit": "x"},
+                    },
+                }
+            )
+        )
+
+        run = DataLoader().load_run(cell)
+
+        # The whole flat key is treated as the metric name; "avg" stat
+        # holds the mean.
+        weird = run.get_metric("weird_metric_unknown")
+        assert weird is not None
+        assert getattr(weird, "avg", None) == 7.0
+        assert getattr(weird, "unit", None) == "x"
+
+
+class TestDataLoaderVariationLabel:
+    """Tests for ``RunMetadata.variation_label`` propagation.
+
+    Distinct from ``run_name`` (always = ``run_path.name``).
+    ``variation_label`` is the cell identity: scenario name for
+    ``ScenarioSweep`` runs, or the legacy ``concurrency_10`` form for
+    grid sweeps. Recovery is layered: aggregate JSON metadata first,
+    parent-dir walk-up for the INDEPENDENT ``<cell>/aggregate/`` shell,
+    falling back to ``run_path.name``. The dashboard uses this to group
+    runs across scenarios; runs with different labels are independent
+    benchmarks and must not be pooled.
+    """
+
+    def test_scenario_trials_one_label_from_dir_name(
+        self, tmp_path: Path, sample_jsonl_data, sample_aggregated_data
+    ) -> None:
+        """ScenarioSweep, trials=1: ``variation_label`` = scenario name.
+
+        Layout: ``<base>/<scenario>/profile_export_aiperf.{jsonl,json}``.
+        Run dir name IS the scenario label.
+        """
+        scenario = tmp_path / "shape_512_128_c10"
+        scenario.mkdir()
+        with open(scenario / "profile_export.jsonl", "w") as f:
+            for record in sample_jsonl_data:
+                f.write(orjson.dumps(record).decode("utf-8") + "\n")
+        (scenario / "profile_export_aiperf.json").write_bytes(
+            orjson.dumps(sample_aggregated_data)
+        )
+
+        run = DataLoader().load_run(scenario)
+
+        assert run.metadata.run_name == "shape_512_128_c10"
+        assert run.metadata.variation_label == "shape_512_128_c10"
+
+    def test_aggregate_metadata_label_overrides_path(self, tmp_path: Path) -> None:
+        """Aggregate JSON metadata's ``variation_label`` is authoritative.
+
+        When the orchestrator stamped a label onto the cell aggregate
+        (which it always does — see
+        ``_export_one_variation_aggregate``), that's the source of
+        truth. The path-based fallback never runs.
+        """
+        cell = tmp_path / "concurrency_42"
+        cell.mkdir()
+        (cell / "profile_export_aiperf_aggregate.json").write_bytes(
+            orjson.dumps(
+                {
+                    "metadata": {
+                        "aggregation_type": "confidence",
+                        "variation_label": "shape_512_128_c42",
+                    },
+                    "metrics": {},
+                }
+            )
+        )
+
+        run = DataLoader().load_run(cell)
+
+        assert run.metadata.variation_label == "shape_512_128_c42"
+
+    def test_independent_aggregate_shell_uses_parent_name(self, tmp_path: Path) -> None:
+        """INDEPENDENT trials>1 layout: ``<base>/<cell>/aggregate/``.
+
+        ``run_path.name == 'aggregate'`` is a generic shell. Without
+        the parent walk-up, the cell identity would be lost for any
+        aggregate JSON that didn't include ``variation_label`` in its
+        metadata block (e.g. tests, older fixture data, hand-built
+        aggregates).
+        """
+        cell_root = tmp_path / "shape_512_128_c10"
+        cell_root.mkdir()
+        agg = cell_root / "aggregate"
+        agg.mkdir()
+        # Aggregate JSON intentionally missing variation_label so the
+        # parent-name fallback is exercised.
+        (agg / "profile_export_aiperf_aggregate.json").write_bytes(
+            orjson.dumps(
+                {"metadata": {"aggregation_type": "confidence"}, "metrics": {}}
+            )
+        )
+
+        run = DataLoader().load_run(agg)
+
+        assert run.metadata.run_name == "aggregate"
+        assert run.metadata.variation_label == "shape_512_128_c10"
+
+    def test_repeated_aggregate_dir_uses_run_name(self, tmp_path: Path) -> None:
+        """REPEATED trials>1 layout: ``<base>/aggregate/<cell>/``.
+
+        ``run_path.name`` IS the cell label here (the parent is the
+        generic ``aggregate`` shell, not the run dir itself). When the
+        aggregate JSON omits ``variation_label``, the path fallback
+        returns ``run_path.name``.
+        """
+        cell = tmp_path / "aggregate" / "shape_512_128_c20"
+        cell.mkdir(parents=True)
+        (cell / "profile_export_aiperf_aggregate.json").write_bytes(
+            orjson.dumps(
+                {"metadata": {"aggregation_type": "confidence"}, "metrics": {}}
+            )
+        )
+
+        run = DataLoader().load_run(cell)
+
+        assert run.metadata.run_name == "shape_512_128_c20"
+        assert run.metadata.variation_label == "shape_512_128_c20"
+
+    def test_single_run_falls_back_to_dir_name(self, single_run_dir: Path) -> None:
+        """Non-sweep single run: ``variation_label`` = ``run_name``.
+
+        No metadata.variation_label and not an aggregate shell, so the
+        fallback returns the directory name verbatim. Documents that
+        the field is always populated, even outside sweep contexts.
+        """
+        run = DataLoader().load_run(single_run_dir)
+
+        assert run.metadata.variation_label == single_run_dir.name
