@@ -40,8 +40,8 @@ export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=21474836480
 export MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
 export MOONCAKE_MASTER=127.0.0.1:50051
 export MOONCAKE_PROTOCOL=rdma
-export MOONCAKE_DEVICE=shca_0,shca_1,shca_2,shca_3
-export MC_TE_FILTERS=shca_0,shca_1,shca_2,shca_3
+export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-shca_0,shca_1,shca_2,shca_3}"
+export MC_TE_FILTERS="${MC_TE_FILTERS:-$MOONCAKE_DEVICE}"
 export MC_STORE_ENABLE_SESSION_CACHE=0
 export MC_STORE_ENABLE_DFS_PREFETCH=0
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
@@ -154,8 +154,8 @@ setsid mooncake_client \
     --local_buffer_size=4GB \
     --master_server_address=127.0.0.1:50051 \
     --metadata_server=P2PHANDSHAKE \
-    --protocol=rdma \
-    --device_names=shca_0,shca_1,shca_2,shca_3 \
+    --protocol="$MOONCAKE_PROTOCOL" \
+    --device_names="$MOONCAKE_DEVICE" \
     --port=50052 \
     --logtostderr \
     --enable_http_server \

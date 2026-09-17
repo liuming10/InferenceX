@@ -443,6 +443,16 @@ def test_dcu_launcher_mounts_read_only_hugging_face_cache_layers() -> None:
     assert '--env "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"' in launcher
     assert '--env "HF_HUB_OFFLINE=1"' in launcher
     assert 'Hugging Face cache is not readable: $cache_dir' in launcher
+    assert 'RDMA_DEVICE_NAMES="${RDMA_DEVICE_NAMES:-shca_0,shca_1,shca_2,shca_3}"' in launcher
+    assert 'MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-$RDMA_DEVICE_NAMES}"' in launcher
+    assert 'RDMA_DEVICES_HOST_PATH="${RDMA_DEVICES_HOST_PATH:-/dev/infiniband}"' in launcher
+    assert 'RDMA_SYSFS_HOST_PATH="${RDMA_SYSFS_HOST_PATH:-/sys/class/infiniband}"' in launcher
+    assert 'Required RDMA HCA is unavailable: $RDMA_SYSFS_HOST_PATH/$rdma_device' in launcher
+    assert '"$RDMA_DEVICES_HOST_PATH:$RDMA_DEVICES_HOST_PATH:none:x-create=dir,rbind,rw"' in launcher
+    assert '"$RDMA_SYSFS_HOST_PATH:$RDMA_SYSFS_HOST_PATH:none:x-create=dir,rbind,ro"' in launcher
+    assert 'Mooncake DFS root is not container-${access}-accessible: $DFS_ROOT_DIR' in launcher
+    assert 'Mooncake preflight passed: DFS root is container-readable/writable/searchable' in launcher
+    assert '--env "MOONCAKE_DEVICE=$MOONCAKE_DEVICE"' in launcher
 
 
 def test_dcu_agentic_services_use_targeted_process_group_cleanup() -> None:
@@ -453,6 +463,9 @@ def test_dcu_agentic_services_use_targeted_process_group_cleanup() -> None:
     assert "setsid mooncake_master" in script
     assert "setsid mooncake_client" in script
     assert 'setsid sglang serve "${SGLANG_ARGS[@]}"' in script
+    assert 'export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-shca_0,shca_1,shca_2,shca_3}"' in script
+    assert '--protocol="$MOONCAKE_PROTOCOL"' in script
+    assert '--device_names="$MOONCAKE_DEVICE"' in script
     assert 'kill -- "-$pgid"' in script
     assert 'kill -KILL -- "-$pgid"' in script
     assert 'stop_service "$SERVER_PID" SGLang' in script

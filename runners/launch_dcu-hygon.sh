@@ -46,6 +46,13 @@ export SQUASH_CACHE_DIR="${SQUASH_CACHE_DIR:-/data02/lium_space/squash}"
 # 使 Mooncake 配置可直接在容器内使用。
 export DFS_ROOT_DIR="${DFS_ROOT_DIR:-/stortest/lium_space/dfs_storage/102111128}"
 
+# Mooncake RDMA transport 使用的 HCA。容器须同时看到 verbs 设备节点和 HCA
+# sysfs 条目，才能将 shca 名称解析为可用 RNIC。
+export RDMA_DEVICE_NAMES="${RDMA_DEVICE_NAMES:-shca_0,shca_1,shca_2,shca_3}"
+export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-$RDMA_DEVICE_NAMES}"
+export RDMA_DEVICES_HOST_PATH="${RDMA_DEVICES_HOST_PATH:-/dev/infiniband}"
+export RDMA_SYSFS_HOST_PATH="${RDMA_SYSFS_HOST_PATH:-/sys/class/infiniband}"
+
 # Hugging Face 将 hub/（snapshot 与 blobs）和 datasets/（Arrow 数据与索引）作为
 # 两套独立缓存。二者均只读映射，AgentX 仅使用已经预下载的 trace，避免容器因
 # 网络不可达或缓存只读而回退下载。
@@ -86,6 +93,27 @@ if [[ ! -d "$DFS_ROOT_DIR" ]]; then
     echo "Mooncake DFS root does not exist: $DFS_ROOT_DIR" >&2
     exit 1
 fi
+for access in r w x; do
+    if ! test "-$access" "$DFS_ROOT_DIR"; then
+        echo "Mooncake DFS root is not host-${access}-accessible: $DFS_ROOT_DIR" >&2
+        exit 1
+    fi
+done
+if [[ ! -d "$RDMA_DEVICES_HOST_PATH" || ! -r "$RDMA_DEVICES_HOST_PATH" || ! -x "$RDMA_DEVICES_HOST_PATH" ]]; then
+    echo "RDMA device directory is not accessible: $RDMA_DEVICES_HOST_PATH" >&2
+    exit 1
+fi
+if [[ ! -d "$RDMA_SYSFS_HOST_PATH" || ! -r "$RDMA_SYSFS_HOST_PATH" || ! -x "$RDMA_SYSFS_HOST_PATH" ]]; then
+    echo "RDMA sysfs directory is not accessible: $RDMA_SYSFS_HOST_PATH" >&2
+    exit 1
+fi
+IFS=',' read -r -a rdma_devices <<< "$RDMA_DEVICE_NAMES"
+for rdma_device in "${rdma_devices[@]}"; do
+    if [[ ! -d "$RDMA_SYSFS_HOST_PATH/$rdma_device" ]]; then
+        echo "Required RDMA HCA is unavailable: $RDMA_SYSFS_HOST_PATH/$rdma_device" >&2
+        exit 1
+    fi
+done
 for cache_dir in "$HF_HUB_CACHE_HOST_PATH" "$HF_DATASETS_CACHE_HOST_PATH"; do
     if [[ ! -d "$cache_dir" || ! -r "$cache_dir" || ! -x "$cache_dir" ]]; then
         echo "Hugging Face cache is not readable: $cache_dir" >&2
@@ -147,6 +175,38 @@ run_dcu_container() {
     enroot remove -f "$container_name" >/dev/null 2>&1 || true
     enroot create --name "$container_name" "$squash_file"
 
+    # 在实际容器身份中确认 Mooncake 所需的 RDMA 发现路径和 DFS 权限。此预检
+    # 仅查询目录及权限位，不会在共享 DFS 中创建、修改或删除任何文件。
+    enroot start --root --rw \
+        --mount "$DFS_ROOT_DIR:$DFS_ROOT_DIR:none:x-create=dir,bind,rw" \
+        --mount "$RDMA_DEVICES_HOST_PATH:$RDMA_DEVICES_HOST_PATH:none:x-create=dir,rbind,rw" \
+        --mount "$RDMA_SYSFS_HOST_PATH:$RDMA_SYSFS_HOST_PATH:none:x-create=dir,rbind,ro" \
+        --env "DFS_ROOT_DIR=$DFS_ROOT_DIR" \
+        --env "RDMA_DEVICE_NAMES=$RDMA_DEVICE_NAMES" \
+        --env "RDMA_DEVICES_HOST_PATH=$RDMA_DEVICES_HOST_PATH" \
+        --env "RDMA_SYSFS_HOST_PATH=$RDMA_SYSFS_HOST_PATH" \
+        "$container_name" bash -c '
+            set -euo pipefail
+            for access in r w x; do
+                if ! test "-$access" "$DFS_ROOT_DIR"; then
+                    echo "Mooncake DFS root is not container-${access}-accessible: $DFS_ROOT_DIR" >&2
+                    exit 1
+                fi
+            done
+            IFS="," read -r -a rdma_devices <<< "$RDMA_DEVICE_NAMES"
+            for rdma_device in "${rdma_devices[@]}"; do
+                if [[ ! -d "$RDMA_SYSFS_HOST_PATH/$rdma_device" ]]; then
+                    echo "Required RDMA HCA is not visible in the container: $RDMA_SYSFS_HOST_PATH/$rdma_device" >&2
+                    exit 1
+                fi
+            done
+            if ! compgen -G "$RDMA_DEVICES_HOST_PATH/*" >/dev/null; then
+                echo "RDMA device nodes are not visible in the container: $RDMA_DEVICES_HOST_PATH" >&2
+                exit 1
+            fi
+            printf "Mooncake preflight passed: DFS root is container-readable/writable/searchable; RDMA HCAs: %s\\n" "$RDMA_DEVICE_NAMES"
+        '
+
     # Bind mount：
     # - workspace：脚本、生成的配置、日志和 benchmark 结果。
     # - model：以原始绝对路径只读挂载 checkpoint。
@@ -160,6 +220,8 @@ run_dcu_container() {
         --mount "$GITHUB_WORKSPACE:/workspace:none:x-create=dir,bind,rw" \
         --mount "$MODEL:$MODEL:none:x-create=dir,bind,ro" \
         --mount "$DFS_ROOT_DIR:$DFS_ROOT_DIR:none:x-create=dir,bind,rw" \
+        --mount "$RDMA_DEVICES_HOST_PATH:$RDMA_DEVICES_HOST_PATH:none:x-create=dir,rbind,rw" \
+        --mount "$RDMA_SYSFS_HOST_PATH:$RDMA_SYSFS_HOST_PATH:none:x-create=dir,rbind,ro" \
         --mount "$HF_HUB_CACHE_HOST_PATH:$HF_HUB_CACHE:none:x-create=dir,bind,ro" \
         --mount "$HF_DATASETS_CACHE_HOST_PATH:$HF_DATASETS_CACHE:none:x-create=dir,bind,ro" \
         --mount '/dev/kfd:/dev/kfd:none:x-create=file,bind,rw' \
@@ -192,6 +254,8 @@ run_dcu_container() {
         --env "HF_HUB_OFFLINE=1" \
         --env "MOONCAKE_DFS_ROOT_DIR=$DFS_ROOT_DIR" \
         --env "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$DFS_ROOT_DIR" \
+        --env "MOONCAKE_DEVICE=$MOONCAKE_DEVICE" \
+        --env "MC_TE_FILTERS=$MOONCAKE_DEVICE" \
         "$container_name" bash "$DCU_BENCHMARK_SCRIPT"
 }
 
