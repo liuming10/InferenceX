@@ -429,14 +429,20 @@ def test_benchmark_templates_preserve_unrelated_docker_containers() -> None:
     assert "docker network prune -f" not in multi_node
 
 
-def test_dcu_launcher_mounts_the_read_only_hugging_face_cache() -> None:
+def test_dcu_launcher_mounts_read_only_hugging_face_cache_layers() -> None:
     launcher = (REPO_ROOT / "runners/launch_dcu-hygon.sh").read_text()
 
-    assert 'HF_HUB_CACHE_HOST_PATH="${HF_HUB_CACHE_HOST_PATH:-/ai_data/datasets/huggingface}"' in launcher
-    assert 'HF_HUB_CACHE="${HF_HUB_CACHE:-/hf_hub_cache}"' in launcher
+    assert 'HF_CACHE_ROOT_HOST_PATH="${HF_CACHE_ROOT_HOST_PATH:-/ai_data/datasets/huggingface}"' in launcher
+    assert 'HF_HUB_CACHE_HOST_PATH="${HF_HUB_CACHE_HOST_PATH:-$HF_CACHE_ROOT_HOST_PATH/hub}"' in launcher
+    assert 'HF_DATASETS_CACHE_HOST_PATH="${HF_DATASETS_CACHE_HOST_PATH:-$HF_CACHE_ROOT_HOST_PATH/datasets}"' in launcher
+    assert 'HF_HUB_CACHE="${HF_HUB_CACHE:-/mnt/hf_hub_cache}"' in launcher
+    assert 'HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/mnt/hf_datasets_cache}"' in launcher
     assert '"$HF_HUB_CACHE_HOST_PATH:$HF_HUB_CACHE:none:x-create=dir,bind,ro"' in launcher
+    assert '"$HF_DATASETS_CACHE_HOST_PATH:$HF_DATASETS_CACHE:none:x-create=dir,bind,ro"' in launcher
     assert '--env "HF_HUB_CACHE=$HF_HUB_CACHE"' in launcher
-    assert 'Hugging Face cache is not readable: $HF_HUB_CACHE_HOST_PATH' in launcher
+    assert '--env "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"' in launcher
+    assert '--env "HF_HUB_OFFLINE=1"' in launcher
+    assert 'Hugging Face cache is not readable: $cache_dir' in launcher
 
 
 def test_dcu_agentic_services_use_targeted_process_group_cleanup() -> None:
