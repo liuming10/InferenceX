@@ -1103,110 +1103,108 @@ jobs:
                   uv run --no-project --exclude-newer PT12H --python 3.12 --with psycopg2-binary --with tabulate
                   python -m infx.results.compare_results results/ >> "$GITHUB_STEP_SUMMARY"
 
-    trigger-ingest:
+    # InferenceX-app ingestion is disabled while DCU results are validated from
+    # the shared filesystem. Archive every uploaded artifact instead.
+    archive-sweep-results:
         needs:
             [
+                setup,
+                canary-sweep,
+                sweep-single-node-1k1k,
+                sweep-single-node-8k1k,
+                sweep-agentic,
+                sweep-multi-node-1k1k,
+                sweep-multi-node-8k1k,
+                sweep-multi-node-agentic,
+                sweep-evals,
+                sweep-agentic-evals,
+                sweep-multi-node-evals,
+                sweep-multi-node-agentic-evals,
                 collect-results,
                 collect-evals,
+                upload-changelog-metadata,
                 calc-success-rate,
-                setup,
-                upload-changelog-metadata,
             ]
-        if: >-
-            always() &&
-            github.event_name == 'push' &&
-            github.ref == 'refs/heads/main' &&
-            needs.setup.result == 'success' &&
-            (
-              (
-                toJson(fromJson(needs.setup.outputs.search-space-config).single_node['agentic']) == 'null' ||
-                toJson(fromJson(needs.setup.outputs.search-space-config).single_node['agentic']) == '[]'
-              ) &&
-              (
-                toJson(fromJson(needs.setup.outputs.search-space-config).multi_node['agentic']) == 'null' ||
-                toJson(fromJson(needs.setup.outputs.search-space-config).multi_node['agentic']) == '[]'
-              )
-            ) &&
-            (
-              needs.collect-results.result != 'skipped' ||
-              needs.collect-evals.result != 'skipped' ||
-              needs.setup.outputs.reuse-enabled == 'true'
-            )
-        runs-on: ubuntu-latest
+        if: ${{ always() && needs.setup.result == 'success' }}
+        runs-on: dcu-hygon_00
+        permissions:
+            actions: read
+            contents: read
+        env:
+            ARCHIVE_ROOT: /stortest/lium_space/agentX/InferenceX_result
+            SOURCE_RUN_ID: ${{ needs.setup.outputs.reuse-enabled == 'true' && needs.setup.outputs.reuse-source-run-id || github.run_id }}
+            SOURCE_REUSED: ${{ needs.setup.outputs.reuse-enabled == 'true' }}
+            NEEDS_JSON: ${{ toJson(needs) }}
         steps:
-            - name: Trigger database ingest
+            - name: Create dated archive staging directory
               run: |
-                  curl -sSf -X POST \
-                    -H "Authorization: Bearer ${{ secrets.INFX_FRONTEND_PAT }}" \
-                    -H "Accept: application/vnd.github+v3+json" \
-                    https://api.github.com/repos/SemiAnalysisAI/InferenceX-app/dispatches \
-                    -d '{
-                      "event_type": "ingest-results",
-                      "client_payload": {
-                        "source-run-id": "${{ needs.setup.outputs.reuse-enabled == 'true' && needs.setup.outputs.reuse-source-run-id || github.run_id }}",
-                        "merge-run-id": "${{ github.run_id }}"
-                      }
-                    }'
+                  set -euo pipefail
+                  archive_date=$(date -u +%F)
+                  archive_dir="$ARCHIVE_ROOT/$archive_date/run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+                  archive_staging="${archive_dir}.staging-${GITHUB_RUNNER_TRACKING_ID:-$$}"
+                  if [[ -e "$archive_dir" || -e "$archive_staging" ]]; then
+                    echo "Archive destination already exists: $archive_dir" >&2
+                    exit 1
+                  fi
+                  install -d -m 0750 "$(dirname "$archive_dir")" "$archive_staging"
+                  echo "ARCHIVE_DIR=$archive_dir" >> "$GITHUB_ENV"
+                  echo "ARCHIVE_STAGING=$archive_staging" >> "$GITHUB_ENV"
 
-    trigger-agentic-ingest:
-        needs:
-            [
-                setup,
-                sweep-agentic,
-                sweep-multi-node-agentic,
-                upload-changelog-metadata,
-            ]
-        if: >-
-            always() &&
-            github.event_name == 'push' &&
-            github.ref == 'refs/heads/main' &&
-            needs.setup.result == 'success' &&
-            needs.upload-changelog-metadata.result == 'success' &&
-            (
-              (
-                needs.setup.outputs.reuse-enabled == 'true' &&
-                (
-                  (
-                    toJson(fromJson(needs.setup.outputs.search-space-config).single_node['agentic']) != 'null' &&
-                    toJson(fromJson(needs.setup.outputs.search-space-config).single_node['agentic']) != '[]'
-                  ) ||
-                  (
-                    toJson(fromJson(needs.setup.outputs.search-space-config).multi_node['agentic']) != 'null' &&
-                    toJson(fromJson(needs.setup.outputs.search-space-config).multi_node['agentic']) != '[]'
-                  )
-                )
-              ) ||
-              (
-                (
-                  needs.sweep-agentic.result == 'success' ||
-                  needs.sweep-multi-node-agentic.result == 'success'
-                ) &&
-                (
-                  needs.sweep-agentic.result == 'success' ||
-                  needs.sweep-agentic.result == 'skipped'
-                ) &&
-                (
-                  needs.sweep-multi-node-agentic.result == 'success' ||
-                  needs.sweep-multi-node-agentic.result == 'skipped'
-                )
-              )
-            )
-        runs-on: ubuntu-latest
-        steps:
-            - name: Trigger agentic database ingest
+            - name: Download source-run artifacts
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+              with:
+                  github-token: ${{ github.token }}
+                  repository: ${{ github.repository }}
+                  run-id: ${{ env.SOURCE_RUN_ID }}
+                  path: ${{ env.ARCHIVE_STAGING }}/artifacts
+                  merge-multiple: false
+
+            - name: Download current-run publication artifacts
+              if: ${{ env.SOURCE_REUSED == 'true' }}
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+              with:
+                  github-token: ${{ github.token }}
+                  repository: ${{ github.repository }}
+                  run-id: ${{ github.run_id }}
+                  pattern: changelog-metadata
+                  path: ${{ env.ARCHIVE_STAGING }}/publication-metadata
+                  merge-multiple: false
+
+            - name: Write archive manifest
               run: |
-                  curl -sSf -X POST \
-                    -H "Authorization: Bearer ${{ secrets.INFX_FRONTEND_PAT }}" \
-                    -H "Accept: application/vnd.github+v3+json" \
-                    https://api.github.com/repos/SemiAnalysisAI/InferenceX-app/dispatches \
-                    -d '{
-                      "event_type": "ingest-agentic-results",
-                      "client_payload": {
-                        "source-run-id": "${{ needs.setup.outputs.reuse-enabled == 'true' && needs.setup.outputs.reuse-source-run-id || github.run_id }}",
-                        "merge-run-id": "${{ github.run_id }}",
-                        "database-target": "production"
-                      }
-                    }'
+                  set -euo pipefail
+                  python3 - <<'PY'
+                  import json
+                  import os
+                  from datetime import datetime, timezone
+                  from pathlib import Path
+
+                  archive = Path(os.environ['ARCHIVE_STAGING'])
+                  manifest = {
+                      'archive_created_at': datetime.now(timezone.utc).isoformat(),
+                      'repository': os.environ['GITHUB_REPOSITORY'],
+                      'ref': os.environ['GITHUB_REF'],
+                      'sha': os.environ['GITHUB_SHA'],
+                      'event_name': os.environ['GITHUB_EVENT_NAME'],
+                      'current_run_id': int(os.environ['GITHUB_RUN_ID']),
+                      'current_run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
+                      'source_run_id': int(os.environ['SOURCE_RUN_ID']),
+                      'source_reused': os.environ['SOURCE_REUSED'] == 'true',
+                      'job_results': json.loads(os.environ['NEEDS_JSON']),
+                  }
+                  (archive / 'archive_manifest.json').write_text(
+                      json.dumps(manifest, indent=2, sort_keys=True) + '\n',
+                      encoding='utf-8',
+                  )
+                  PY
+                  cp "$GITHUB_EVENT_PATH" "$ARCHIVE_STAGING/github_event.json"
+
+            - name: Publish archive
+              run: |
+                  set -euo pipefail
+                  mv "$ARCHIVE_STAGING" "$ARCHIVE_DIR"
+                  echo "## Local sweep archive" >> "$GITHUB_STEP_SUMMARY"
+                  echo "\`$ARCHIVE_DIR\`" >> "$GITHUB_STEP_SUMMARY"
 
     comment-unofficial-run-visualizer:
         needs:

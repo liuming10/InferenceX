@@ -530,6 +530,7 @@ def planning_repo(tmp_path, monkeypatch):
         shutil.copytree(source / directory, tmp_path / directory)
     (tmp_path / "configs").mkdir()
     (tmp_path / "configs/amd-master.yaml").write_text("{}\n")
+    (tmp_path / "configs/dcu-master.yaml").write_text("{}\n")
     runners = {"labels": {"cluster:fixture": ["node-a"]}, "hardware": {
         "cluster:fixture": {"gpus-per-node": 8, "available-cpu-dram-mib": 1024000},
     }}
@@ -830,8 +831,14 @@ def test_current_plan_loads_inputs_once_and_uses_no_generator_process(planning_r
     assert [r["conc"] for r in result["single_node"]["8k1k"]] == [16, 32, 64]
     assert result["multi_node"]["8k1k"][0]["node-count"] == 2
     assert {path: reads[path] for path in (
-        "configs/amd-master.yaml", "configs/nvidia-master.yaml", "configs/runners.yaml",
-    )} == {"configs/amd-master.yaml": 1, "configs/nvidia-master.yaml": 1, "configs/runners.yaml": 1}
+        "configs/amd-master.yaml", "configs/nvidia-master.yaml", "configs/dcu-master.yaml",
+        "configs/runners.yaml",
+    )} == {
+        "configs/amd-master.yaml": 1,
+        "configs/nvidia-master.yaml": 1,
+        "configs/dcu-master.yaml": 1,
+        "configs/runners.yaml": 1,
+    }
 
 
 def test_generation_api_preserves_inputs_and_returns_independent_nested_rows(planning_repo):

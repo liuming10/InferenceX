@@ -396,6 +396,24 @@ def test_changelog_validation_has_no_write_token_or_persisted_credential() -> No
     assert checkout["with"]["persist-credentials"] == "false"
 
 
+def test_sweep_results_archive_locally_without_app_dispatch() -> None:
+    workflow_text = (REPO_ROOT / ".github/workflows/run-sweep.yml").read_text()
+    job = _WF["jobs"]["archive-sweep-results"]
+
+    assert "trigger-ingest" not in _WF["jobs"]
+    assert "trigger-agentic-ingest" not in _WF["jobs"]
+    assert "InferenceX-app/dispatches" not in workflow_text
+    assert "ingest-agentic-results" not in workflow_text
+    assert job["runs-on"] == "dcu-hygon_00"
+    assert job["env"]["ARCHIVE_ROOT"] == "/stortest/lium_space/agentX/InferenceX_result"
+    assert "upload-changelog-metadata" in job["needs"]
+    assert "calc-success-rate" in job["needs"]
+    assert any(
+        step.get("uses", "").startswith("actions/download-artifact@")
+        for step in job["steps"]
+    )
+
+
 @pytest.mark.parametrize("is_pr,body,previous,expected", [
     (True, "/reuse-sweep-run 123", None, True),
     (True, "withdrawn", "/reuse-sweep-run 123", True),

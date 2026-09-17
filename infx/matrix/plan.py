@@ -130,8 +130,10 @@ def generation_inputs_at_ref(ref: str):
             text=True,
         )
         repo_paths = files_result.stdout.splitlines()
+        available_master_configs = [
+            path for path in MASTER_CONFIGS if path in repo_paths
+        ]
         required_paths = {
-            *MASTER_CONFIGS,
             "configs/runners.yaml",
             GENERATE_SWEEPS_PY_SCRIPT,
         }
@@ -140,6 +142,10 @@ def generation_inputs_at_ref(ref: str):
             raise ValueError(
                 f"append-only base revision is missing generation inputs: "
                 f"{sorted(missing_paths)}"
+            )
+        if not available_master_configs:
+            raise ValueError(
+                "append-only base revision is missing all master configuration inputs"
             )
 
         for repo_path in repo_paths:
@@ -153,7 +159,7 @@ def generation_inputs_at_ref(ref: str):
             destination.write_bytes(result.stdout)
 
         yield GenerationInputs(
-            config_files=[str(Path(temp_dir) / path) for path in MASTER_CONFIGS],
+            config_files=[str(Path(temp_dir) / path) for path in available_master_configs],
             generator_script=str(Path(temp_dir) / GENERATE_SWEEPS_PY_SCRIPT),
             runner_config=str(Path(temp_dir) / "configs/runners.yaml"),
         )
