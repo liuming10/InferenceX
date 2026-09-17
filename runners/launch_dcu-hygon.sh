@@ -16,6 +16,7 @@ export DCU_CPUS_PER_TASK="${DCU_CPUS_PER_TASK:-128}"
 export DCU_TIME_LIMIT="${DCU_TIME_LIMIT:-500}"
 export SQUASH_CACHE_DIR="${SQUASH_CACHE_DIR:-/data02/lium_space/squash}"
 export DFS_ROOT_DIR="${DFS_ROOT_DIR:-/stortest/lium_space/dfs_storage/102111128}"
+export ENROOT_RUNTIME_PATH="${ENROOT_RUNTIME_PATH:-/data02/lium_space/tmp/enroot-${UID}/runtime}"
 export DCU_BENCHMARK_SCRIPT="/workspace/benchmarks/single_node/${SCENARIO_SUBDIR:-fixed_seq_len/}${EXP_NAME%%_*}_${PRECISION}_dcu-hygon_${FRAMEWORK}.sh"
 
 if [[ "$FRAMEWORK" != "sglang" ]]; then
@@ -113,4 +114,5 @@ srun \
     --cpus-per-task="$DCU_CPUS_PER_TASK" \
     --time="$DCU_TIME_LIMIT" \
     --job-name="${RUNNER_NAME:-dcu-hygon}" \
+    --export=ALL,ENROOT_RUNTIME_PATH \
     bash -c run_dcu_container
