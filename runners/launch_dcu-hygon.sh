@@ -54,9 +54,9 @@ export RDMA_DEVICES_HOST_PATH="${RDMA_DEVICES_HOST_PATH:-/dev/infiniband}"
 export RDMA_SYSFS_HOST_PATH="${RDMA_SYSFS_HOST_PATH:-/sys/class/infiniband}"
 
 # Hugging Face 将 hub/（snapshot 与 blobs）和 datasets/（Arrow 数据与索引）作为
-# 两套独立缓存。二者均只读映射，AgentX 仅使用已经预下载的 trace，避免容器因
-# 网络不可达或缓存只读而回退下载。
-export HF_CACHE_ROOT_HOST_PATH="${HF_CACHE_ROOT_HOST_PATH:-/ai_data/datasets/huggingface}"
+# 两套独立缓存。模型 hub 缓存保持只读；datasets 在命中缓存时仍会创建 FileLock，
+# 因此必须读写挂载，否则 AIPerf 会在 DatasetBuilder 初始化前失败。
+export HF_CACHE_ROOT_HOST_PATH="${HF_CACHE_ROOT_HOST_PATH:-/stortest/lium_space/agentX/actions-runner/huggingface}"
 export HF_HUB_CACHE_HOST_PATH="${HF_HUB_CACHE_HOST_PATH:-$HF_CACHE_ROOT_HOST_PATH/hub}"
 export HF_DATASETS_CACHE_HOST_PATH="${HF_DATASETS_CACHE_HOST_PATH:-$HF_CACHE_ROOT_HOST_PATH/datasets}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-/mnt/hf_hub_cache}"
@@ -114,12 +114,14 @@ for rdma_device in "${rdma_devices[@]}"; do
         exit 1
     fi
 done
-for cache_dir in "$HF_HUB_CACHE_HOST_PATH" "$HF_DATASETS_CACHE_HOST_PATH"; do
-    if [[ ! -d "$cache_dir" || ! -r "$cache_dir" || ! -x "$cache_dir" ]]; then
-        echo "Hugging Face cache is not readable: $cache_dir" >&2
-        exit 1
-    fi
-done
+if [[ ! -d "$HF_HUB_CACHE_HOST_PATH" || ! -r "$HF_HUB_CACHE_HOST_PATH" || ! -x "$HF_HUB_CACHE_HOST_PATH" ]]; then
+    echo "Hugging Face hub cache is not readable: $HF_HUB_CACHE_HOST_PATH" >&2
+    exit 1
+fi
+if [[ ! -d "$HF_DATASETS_CACHE_HOST_PATH" || ! -r "$HF_DATASETS_CACHE_HOST_PATH" || ! -w "$HF_DATASETS_CACHE_HOST_PATH" || ! -x "$HF_DATASETS_CACHE_HOST_PATH" ]]; then
+    echo "Hugging Face datasets cache is not readable/writable: $HF_DATASETS_CACHE_HOST_PATH" >&2
+    exit 1
+fi
 
 # srun 会启动新的 Bash 进程。导出该函数，使新进程可在申请到的 DCU 资源中
 # 执行镜像缓存与容器生命周期逻辑。
@@ -235,7 +237,7 @@ run_dcu_container() {
         --mount "$RDMA_DEVICES_HOST_PATH:$RDMA_DEVICES_HOST_PATH:none:x-create=dir,rbind,rw" \
         --mount "$RDMA_SYSFS_HOST_PATH:$RDMA_SYSFS_HOST_PATH:none:x-create=dir,rbind,ro" \
         --mount "$HF_HUB_CACHE_HOST_PATH:$HF_HUB_CACHE:none:x-create=dir,bind,ro" \
-        --mount "$HF_DATASETS_CACHE_HOST_PATH:$HF_DATASETS_CACHE:none:x-create=dir,bind,ro" \
+        --mount "$HF_DATASETS_CACHE_HOST_PATH:$HF_DATASETS_CACHE:none:x-create=dir,bind,rw" \
         --mount '/dev/kfd:/dev/kfd:none:x-create=file,bind,rw' \
         --mount '/dev/dri:/dev/dri:none:x-create=dir,rbind,rw' \
         --mount '/dev/mkfd:/dev/mkfd:none:x-create=file,bind,rw' \
@@ -264,6 +266,7 @@ run_dcu_container() {
         --env "HF_HUB_CACHE=$HF_HUB_CACHE" \
         --env "HF_DATASETS_CACHE=$HF_DATASETS_CACHE" \
         --env "HF_HUB_OFFLINE=1" \
+        --env "HF_DATASETS_OFFLINE=1" \
         --env "MOONCAKE_DFS_ROOT_DIR=$DFS_ROOT_DIR" \
         --env "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$DFS_ROOT_DIR" \
         --env "MOONCAKE_DEVICE=$MOONCAKE_DEVICE" \
