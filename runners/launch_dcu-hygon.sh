@@ -93,7 +93,7 @@ if [[ ! -d "$DFS_ROOT_DIR" ]]; then
     echo "Mooncake DFS root does not exist: $DFS_ROOT_DIR" >&2
     exit 1
 fi
-for access in r w x; do
+for access in r x; do
     if ! test "-$access" "$DFS_ROOT_DIR"; then
         echo "Mooncake DFS root is not host-${access}-accessible: $DFS_ROOT_DIR" >&2
         exit 1
@@ -175,8 +175,8 @@ run_dcu_container() {
     enroot remove -f "$container_name" >/dev/null 2>&1 || true
     enroot create --name "$container_name" "$squash_file"
 
-    # 在实际容器身份中确认 Mooncake 所需的 RDMA 发现路径和 DFS 权限。此预检
-    # 仅查询目录及权限位，不会在共享 DFS 中创建、修改或删除任何文件。
+    # 在实际容器身份中确认 Mooncake 所需的 RDMA 发现路径和 DFS 权限。DFS
+    # probe 只会创建、读取并删除一个由本次容器 ID 唯一限定的临时目录与文件。
     enroot start --root --rw \
         --mount "$DFS_ROOT_DIR:$DFS_ROOT_DIR:none:x-create=dir,bind,rw" \
         --mount "$RDMA_DEVICES_HOST_PATH:$RDMA_DEVICES_HOST_PATH:none:x-create=dir,rbind,rw" \
@@ -185,9 +185,10 @@ run_dcu_container() {
         --env "RDMA_DEVICE_NAMES=$RDMA_DEVICE_NAMES" \
         --env "RDMA_DEVICES_HOST_PATH=$RDMA_DEVICES_HOST_PATH" \
         --env "RDMA_SYSFS_HOST_PATH=$RDMA_SYSFS_HOST_PATH" \
+        --env "DFS_PROBE_NAME=.inferencex-dfs-probe-${container_name}" \
         "$container_name" bash -c '
             set -euo pipefail
-            for access in r w x; do
+            for access in r x; do
                 if ! test "-$access" "$DFS_ROOT_DIR"; then
                     echo "Mooncake DFS root is not container-${access}-accessible: $DFS_ROOT_DIR" >&2
                     exit 1
@@ -204,6 +205,17 @@ run_dcu_container() {
                 echo "RDMA device nodes are not visible in the container: $RDMA_DEVICES_HOST_PATH" >&2
                 exit 1
             fi
+            dfs_probe="$DFS_ROOT_DIR/$DFS_PROBE_NAME"
+            cleanup_dfs_probe() {
+                rm -rf -- "$dfs_probe"
+            }
+            trap cleanup_dfs_probe EXIT INT TERM
+            mkdir "$dfs_probe"
+            printf "inferencex-dfs-probe\\n" > "$dfs_probe/write-test"
+            test -r "$dfs_probe/write-test"
+            test -s "$dfs_probe/write-test"
+            cleanup_dfs_probe
+            trap - EXIT INT TERM
             printf "Mooncake preflight passed: DFS root is container-readable/writable/searchable; RDMA HCAs: %s\\n" "$RDMA_DEVICE_NAMES"
         '
 
