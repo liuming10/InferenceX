@@ -429,6 +429,16 @@ def test_benchmark_templates_preserve_unrelated_docker_containers() -> None:
     assert "docker network prune -f" not in multi_node
 
 
+def test_dcu_launcher_mounts_the_read_only_hugging_face_cache() -> None:
+    launcher = (REPO_ROOT / "runners/launch_dcu-hygon.sh").read_text()
+
+    assert 'HF_HUB_CACHE_HOST_PATH="${HF_HUB_CACHE_HOST_PATH:-/ai_data/datasets/huggingface}"' in launcher
+    assert 'HF_HUB_CACHE="${HF_HUB_CACHE:-/hf_hub_cache}"' in launcher
+    assert '"$HF_HUB_CACHE_HOST_PATH:$HF_HUB_CACHE:none:x-create=dir,bind,ro"' in launcher
+    assert '--env "HF_HUB_CACHE=$HF_HUB_CACHE"' in launcher
+    assert 'Hugging Face cache is not readable: $HF_HUB_CACHE_HOST_PATH' in launcher
+
+
 def test_dcu_agentic_services_use_targeted_process_group_cleanup() -> None:
     script = (
         REPO_ROOT / "benchmarks/single_node/agentic/dsv4flash_w4a8_dcu-hygon_sglang.sh"

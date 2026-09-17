@@ -46,6 +46,11 @@ export SQUASH_CACHE_DIR="${SQUASH_CACHE_DIR:-/data02/lium_space/squash}"
 # 使 Mooncake 配置可直接在容器内使用。
 export DFS_ROOT_DIR="${DFS_ROOT_DIR:-/stortest/lium_space/dfs_storage/102111128}"
 
+# 宿主机已预下载的 Hugging Face 缓存根目录。须挂载完整根目录而不是仅挂载某个
+# 数据集目录，以保留 hub/ 快照、blobs 和 datasets/ 元数据之间的引用关系。
+export HF_HUB_CACHE_HOST_PATH="${HF_HUB_CACHE_HOST_PATH:-/ai_data/datasets/huggingface}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-/hf_hub_cache}"
+
 # 宿主机侧的 Enroot 运行时状态目录。非 root runner 无法使用 /run/enroot，
 # 因此在 /data02 上使用按 UID 隔离的私有目录。该目录不是容器挂载点。
 export ENROOT_RUNTIME_PATH="${ENROOT_RUNTIME_PATH:-/data02/lium_space/tmp/enroot-${UID}/runtime}"
@@ -75,6 +80,10 @@ if [[ ! -d "$MODEL" ]]; then
 fi
 if [[ ! -d "$DFS_ROOT_DIR" ]]; then
     echo "Mooncake DFS root does not exist: $DFS_ROOT_DIR" >&2
+    exit 1
+fi
+if [[ ! -d "$HF_HUB_CACHE_HOST_PATH" || ! -r "$HF_HUB_CACHE_HOST_PATH" || ! -x "$HF_HUB_CACHE_HOST_PATH" ]]; then
+    echo "Hugging Face cache is not readable: $HF_HUB_CACHE_HOST_PATH" >&2
     exit 1
 fi
 
@@ -136,6 +145,7 @@ run_dcu_container() {
     # - workspace：脚本、生成的配置、日志和 benchmark 结果。
     # - model：以原始绝对路径只读挂载 checkpoint。
     # - DFS root：以原始路径读写挂载 Mooncake 后端存储。
+    # - Hugging Face cache：以只读方式映射到 /hf_hub_cache，供 AgentX 复用本地 trace。
     # - DCU 设备与 /opt/hyhal：Hygon 驱动接口及用户态运行时。
     #
     # 下方环境变量按用途划分：端点/模型、并行参数、AgentX 负载与结果、
@@ -144,6 +154,7 @@ run_dcu_container() {
         --mount "$GITHUB_WORKSPACE:/workspace:none:x-create=dir,bind,rw" \
         --mount "$MODEL:$MODEL:none:x-create=dir,bind,ro" \
         --mount "$DFS_ROOT_DIR:$DFS_ROOT_DIR:none:x-create=dir,bind,rw" \
+        --mount "$HF_HUB_CACHE_HOST_PATH:$HF_HUB_CACHE:none:x-create=dir,bind,ro" \
         --mount '/dev/kfd:/dev/kfd:none:x-create=file,bind,rw' \
         --mount '/dev/dri:/dev/dri:none:x-create=dir,rbind,rw' \
         --mount '/dev/mkfd:/dev/mkfd:none:x-create=file,bind,rw' \
@@ -169,6 +180,7 @@ run_dcu_container() {
         --env "IS_AGENTIC=${IS_AGENTIC:-0}" \
         --env "AIPERF_FAILED_REQUEST_THRESHOLD=${AIPERF_FAILED_REQUEST_THRESHOLD:-0.10}" \
         --env "AIPERF_EXPERIMENTAL_FAST=${AIPERF_EXPERIMENTAL_FAST:-0}" \
+        --env "HF_HUB_CACHE=$HF_HUB_CACHE" \
         --env "MOONCAKE_DFS_ROOT_DIR=$DFS_ROOT_DIR" \
         --env "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$DFS_ROOT_DIR" \
         "$container_name" bash "$DCU_BENCHMARK_SCRIPT"
