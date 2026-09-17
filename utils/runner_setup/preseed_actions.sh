@@ -12,7 +12,7 @@ fi
 RUNNER_DIR=$(cd "$1" && pwd -P)
 ARCHIVE_DIR=${2:-"$RUNNER_DIR/arch"}
 ARCHIVE_DIR=$(cd "$ARCHIVE_DIR" && pwd -P)
-ACTIONS_DIR="$RUNNER_DIR/_work/_actions/actions"
+ACTIONS_DIR="$RUNNER_DIR/_work/_actions"
 
 if [[ ! -f "$RUNNER_DIR/run.sh" ]]; then
     echo "Not an actions-runner directory: $RUNNER_DIR" >&2
