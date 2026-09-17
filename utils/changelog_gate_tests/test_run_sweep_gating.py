@@ -464,10 +464,27 @@ def test_dcu_agentic_services_use_targeted_process_group_cleanup() -> None:
         REPO_ROOT / "benchmarks/single_node/agentic/dsv4flash_w4a8_dcu-hygon_sglang.sh"
     ).read_text()
 
-    assert "setsid mooncake_master" in script
-    assert "setsid mooncake_client" in script
-    assert 'setsid sglang serve "${SGLANG_ARGS[@]}"' in script
+    assert 'setsid env "${SERVICE_ENV_UNSETS[@]}" "${MASTER_ENV[@]}" mooncake_master' in script
+    assert 'setsid env "${SERVICE_ENV_UNSETS[@]}" "${CLIENT_ENV[@]}" mooncake_client' in script
+    assert 'setsid env "${SERVICE_ENV_UNSETS[@]}" "${SGLANG_ENV[@]}" sglang serve "${SGLANG_ARGS[@]}"' in script
+    assert "SERVICE_ENV_NAMES=(" in script
+    assert 'SERVICE_ENV_UNSETS+=(-u "$service_env_name")' in script
+    assert "MASTER_ENV=(" in script
+    assert "CLIENT_ENV=(" in script
+    assert "SGLANG_ENV=(" in script
+    assert 'AIPERF_HTTP_TCP_USER_TIMEOUT' in script
+    assert '"AIPERF_HTTP_TCP_USER_TIMEOUT=$AIPERF_HTTP_TCP_USER_TIMEOUT"' not in script
     assert 'export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-shca_0,shca_1,shca_2,shca_3}"' in script
+    assert 'export MC_STORE_CLIENT_METRIC="${MC_STORE_CLIENT_METRIC:-1}"' in script
+    assert 'export SGLANG_ROCM_USE_AITER_TILELANG_MHC="${SGLANG_ROCM_USE_AITER_TILELANG_MHC:-1}"' in script
+    assert 'export SGLANG_W4A8_TPMOE_BACKEND="${SGLANG_W4A8_TPMOE_BACKEND:-aiter}"' in script
+    assert 'export MOONCAKE_DFS_BATCH_READ_THREADS="${MOONCAKE_DFS_BATCH_READ_THREADS:-128}"' in script
+    assert 'export MC_STORE_DFS_H2D_KERNEL="${MC_STORE_DFS_H2D_KERNEL:-1}"' in script
+    assert '    --eviction_ratio=0.2 \\' in script
+    assert 'MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"' in script
+    assert 'CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-8}"' in script
+    assert '    --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS"' in script
+    assert '    --max-running-requests "$MAX_RUNNING_REQUESTS"' in script
     assert 'unset PYTHONPYCACHEPREFIX' in script
     assert '--protocol="$MOONCAKE_PROTOCOL"' in script
     assert '--device_names="$MOONCAKE_DEVICE"' in script
