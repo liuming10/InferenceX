@@ -83,7 +83,12 @@ preseed_action() {
     local archive
 
     if [[ -f "$destination/action.yml" && -f "$destination/$entrypoint" ]]; then
-        echo "Action cache hit: $repository@$sha"
+        if [[ ! -f "$destination.completed" ]]; then
+            date --utc +%FT%TZ > "$destination.completed"
+            echo "Repaired action cache watermark: $repository@$sha"
+        else
+            echo "Action cache hit: $repository@$sha"
+        fi
         return
     fi
     if [[ -e "$destination" ]]; then
@@ -98,6 +103,7 @@ preseed_action() {
         echo "Installed action cache entry is incomplete: $destination" >&2
         exit 1
     fi
+    date --utc +%FT%TZ > "$destination.completed"
 }
 
 preseed_action "checkout" "3d3c42e5aac5ba805825da76410c181273ba90b1" "dist/index.js"

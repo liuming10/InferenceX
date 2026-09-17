@@ -130,8 +130,8 @@ Required permissions (all of these endpoints require **admin access to the repos
    ```
 
    On every startup, `start_runners.sh` installs a missing package into each runner's
-   persistent cache at `_work/_actions/actions/<action>/<SHA>/`; a complete cache entry is
-   reused unchanged. This occurs before `run.sh`, so no workflow step needs network access to
+   persistent cache at `_work/_actions/actions/<action>/<SHA>/`, together with the Runner's
+   required sibling `<SHA>.completed` watermark; a complete cache entry is reused unchanged. This occurs before `run.sh`, so no workflow step needs network access to
    download these Actions. When a workflow changes an Action SHA, stage its matching package
    before restarting the runners.
 
