@@ -4,6 +4,11 @@ set -euo pipefail
 
 source "$(dirname "$0")/../../benchmark_lib.sh"
 
+# The DCU SGLang image's Python importlib fails with a nonempty bytecode cache
+# prefix. Keep bytecode disabled by the shared library while clearing only this
+# recipe's inherited prefix before importing SGLang.
+unset PYTHONPYCACHEPREFIX
+
 check_env_vars \
     MODEL \
     TP \

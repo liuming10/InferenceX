@@ -468,6 +468,7 @@ def test_dcu_agentic_services_use_targeted_process_group_cleanup() -> None:
     assert "setsid mooncake_client" in script
     assert 'setsid sglang serve "${SGLANG_ARGS[@]}"' in script
     assert 'export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-shca_0,shca_1,shca_2,shca_3}"' in script
+    assert 'unset PYTHONPYCACHEPREFIX' in script
     assert '--protocol="$MOONCAKE_PROTOCOL"' in script
     assert '--device_names="$MOONCAKE_DEVICE"' in script
     assert 'kill -- "-$pgid"' in script
