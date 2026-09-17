@@ -396,6 +396,21 @@ def test_changelog_validation_has_no_write_token_or_persisted_credential() -> No
     assert checkout["with"]["persist-credentials"] == "false"
 
 
+def test_benchmark_checkout_falls_back_to_the_read_only_workflow_token() -> None:
+    workflow = yaml.load(
+        (REPO_ROOT / ".github/workflows/benchmark-tmpl.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    checkout = next(
+        step
+        for step in workflow["jobs"]["benchmark"]["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+
+    assert workflow["permissions"] == {"contents": "read"}
+    assert checkout["with"]["token"] == "${{ secrets.REPO_PAT || github.token }}"
+
+
 def test_setup_logs_and_publishes_generated_test_matrix() -> None:
     workflow_text = (REPO_ROOT / ".github/workflows/run-sweep.yml").read_text()
 
