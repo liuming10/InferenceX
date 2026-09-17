@@ -81,19 +81,42 @@ wait_for_tcp_port() {
     exec 3<&-
 }
 
-stop_pid() {
+# 每项后台服务都用独立 session 启动，因此其 PID 也是专属进程组 ID。失败时
+# 可连同服务创建的子进程一起回收，而不会按名称误杀其他作业的服务。
+stop_service() {
     local pid="$1"
     local name="$2"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        echo "Stopping $name (PID=$pid)"
-        kill "$pid" 2>/dev/null || true
-        for _ in {1..30}; do
-            kill -0 "$pid" 2>/dev/null || return 0
-            sleep 1
-        done
-        kill -KILL "$pid" 2>/dev/null || true
+    local pgid
+
+    [[ -n "$pid" ]] || return 0
+    if ! kill -0 "$pid" 2>/dev/null; then
         wait "$pid" 2>/dev/null || true
+        return 0
     fi
+
+    pgid=$(ps -o pgid= -p "$pid" | tr -d '[:space:]')
+    if [[ "$pgid" != "$pid" ]]; then
+        echo "Refusing to stop $name as a process group: PID=$pid PGID=${pgid:-unknown}" >&2
+        kill "$pid" 2>/dev/null || true
+    else
+        echo "Stopping $name process group (PGID=$pgid)"
+        kill -- "-$pgid" 2>/dev/null || true
+    fi
+
+    for _ in {1..30}; do
+        kill -0 "$pid" 2>/dev/null || {
+            wait "$pid" 2>/dev/null || true
+            return 0
+        }
+        sleep 1
+    done
+
+    if [[ "$pgid" == "$pid" ]]; then
+        kill -KILL -- "-$pgid" 2>/dev/null || true
+    else
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
 }
 
 capture_server_metrics() {
@@ -106,9 +129,9 @@ cleanup() {
     local rc=$?
     trap - EXIT INT TERM
     capture_server_metrics
-    stop_pid "$SERVER_PID" SGLang
-    stop_pid "$CLIENT_PID" Mooncake-client
-    stop_pid "$MASTER_PID" Mooncake-master
+    stop_service "$SERVER_PID" SGLang
+    stop_service "$CLIENT_PID" Mooncake-client
+    stop_service "$MASTER_PID" Mooncake-master
     exit "$rc"
 }
 trap cleanup EXIT INT TERM
@@ -116,7 +139,7 @@ trap cleanup EXIT INT TERM
 resolve_trace_source
 install_agentic_deps
 
-mooncake_master \
+setsid mooncake_master \
     --logtostderr \
     --eviction_high_watermark_ratio=0.8 \
     --enable_http_metadata_server \
@@ -125,7 +148,7 @@ mooncake_master \
 MASTER_PID=$!
 wait_for_tcp_port 127.0.0.1 50051 "$MASTER_LOG" "$MASTER_PID"
 
-mooncake_client \
+setsid mooncake_client \
     --host=127.0.0.1 \
     --global_segment_size=160GB \
     --local_buffer_size=4GB \
@@ -198,7 +221,7 @@ write_command "$RESULT_DIR/sglang_command.txt" sglang serve "${SGLANG_ARGS[@]}"
     echo "===================================="
 } >> "$SERVER_LOG"
 
-sglang serve "${SGLANG_ARGS[@]}" >>"$SERVER_LOG" 2>&1 &
+setsid sglang serve "${SGLANG_ARGS[@]}" >>"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_for_server_ready --port "$PORT" --server-log "$SERVER_LOG" --server-pid "$SERVER_PID"
 capture_server_metrics

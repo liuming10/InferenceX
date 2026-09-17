@@ -429,6 +429,23 @@ def test_benchmark_templates_preserve_unrelated_docker_containers() -> None:
     assert "docker network prune -f" not in multi_node
 
 
+def test_dcu_agentic_services_use_targeted_process_group_cleanup() -> None:
+    script = (
+        REPO_ROOT / "benchmarks/single_node/agentic/dsv4flash_w4a8_dcu-hygon_sglang.sh"
+    ).read_text()
+
+    assert "setsid mooncake_master" in script
+    assert "setsid mooncake_client" in script
+    assert 'setsid sglang serve "${SGLANG_ARGS[@]}"' in script
+    assert 'kill -- "-$pgid"' in script
+    assert 'kill -KILL -- "-$pgid"' in script
+    assert 'stop_service "$SERVER_PID" SGLang' in script
+    assert 'stop_service "$CLIENT_PID" Mooncake-client' in script
+    assert 'stop_service "$MASTER_PID" Mooncake-master' in script
+    assert "pkill" not in script
+    assert "killall" not in script
+
+
 def test_setup_logs_and_publishes_generated_test_matrix() -> None:
     workflow_text = (REPO_ROOT / ".github/workflows/run-sweep.yml").read_text()
 
