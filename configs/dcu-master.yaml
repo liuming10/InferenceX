@@ -2,7 +2,7 @@
 # the runner and must remain an absolute path; it is bind-mounted into Enroot at
 # the same location by runners/launch_dcu-hygon.sh.
 dsv4flash-w4a8-dcu-hygon-sglang:
-  image: 42.228.13.241:5000/jenkins/model_test_env/vllm:0.25.1-ubuntu22.04-dtk2604-py3.10-20260831-0300
+  image: 42.228.13.241:5000/jenkins/model_test_env/sglang:0.5.18-ubuntu22.04-dtk2604-py3.10-20260905-2100-xunfei-mc
   model: /ai_data/models/DeepSeek-V4-Flash-0731-W4A8-INT4-Channel-Attn-W8A8-INT8-Channel
   model-prefix: dsv4flash
   runner: dcu-hygon_00
