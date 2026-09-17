@@ -2973,6 +2973,7 @@ resolve_trace_source() {
     esac
     local loader="${WEKA_LOADER_OVERRIDE:-$default_loader}"
     local dataset
+    export HF_ENDPOINT=https://hf-mirror.com
     case "$loader" in
         semianalysis_cc_traces_weka_with_subagents)
             dataset="semianalysisai/cc-traces-weka-061526"
