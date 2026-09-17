@@ -1009,16 +1009,20 @@ jobs:
                   python3 - <<'PY'
                   import json, os
                   from pathlib import Path
-                  matrix = json.loads(os.environ['SWEEP_MATRIX'])
-                  labels = set(json.loads(os.environ['SWEEP_LABELS']) or [])
+
+                  matrix_raw = os.environ.get('SWEEP_MATRIX', '').strip()
+                  labels_raw = os.environ.get('SWEEP_LABELS', '').strip()
+                  matrix = json.loads(matrix_raw) if matrix_raw else {}
+                  labels = set(json.loads(labels_raw) if labels_raw else [])
                   incompatible = {'sweep-enabled', 'non-canary-full-sweep-enabled', 'full-sweep-fail-fast',
                                   'full-sweep-fail-fast-no-canary', 'evals-only', 'agentx-fast'}
-                  Path('changelog_metadata.json').write_text(json.dumps(matrix['changelog_metadata']))
+                  Path('changelog_metadata.json').write_text(json.dumps(matrix.get('changelog_metadata', {})))
                   Path('sweep_manifest.json').write_text(json.dumps({
                       'head': os.environ['SWEEP_HEAD'], 'run-id': int(os.environ['GITHUB_RUN_ID']),
                       'run-attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
-                      'full-sweep': os.environ['FULL_SWEEP'] == 'true' and not labels & incompatible,
+                      'full-sweep': bool(matrix) and os.environ['FULL_SWEEP'] == 'true' and not labels & incompatible,
                       'matrix': matrix,
+                      'matrix-generated': bool(matrix),
                   }))
                   PY
 
@@ -1190,7 +1194,7 @@ jobs:
                       'current_run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
                       'source_run_id': int(os.environ['SOURCE_RUN_ID']),
                       'source_reused': os.environ['SOURCE_REUSED'] == 'true',
-                      'job_results': json.loads(os.environ['NEEDS_JSON']),
+                      'job_results': json.loads(os.environ.get('NEEDS_JSON') or '{}'),
                   }
                   (archive / 'archive_manifest.json').write_text(
                       json.dumps(manifest, indent=2, sort_keys=True) + '\n',

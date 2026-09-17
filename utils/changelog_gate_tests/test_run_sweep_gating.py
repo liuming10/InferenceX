@@ -406,6 +406,9 @@ def test_sweep_results_archive_locally_without_app_dispatch() -> None:
     assert "ingest-agentic-results" not in workflow_text
     assert job["runs-on"] == "dcu-hygon_00"
     assert job["env"]["ARCHIVE_ROOT"] == "/stortest/lium_space/agentX/InferenceX_result"
+    assert "json.loads(os.environ.get('NEEDS_JSON') or '{}')" in workflow_text
+    assert "matrix = json.loads(matrix_raw) if matrix_raw else {}" in workflow_text
+    assert "'matrix-generated': bool(matrix)" in workflow_text
     assert "upload-changelog-metadata" in job["needs"]
     assert "calc-success-rate" in job["needs"]
     assert any(
