@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 import yaml
 
@@ -269,13 +271,40 @@ def test_matrix_compatible_check_forwards_eval_modifiers(
     assert calls == [(True, True)]
 
 
-def test_matrix_compatible_check_rejects_pr_1717_conflict_resolution() -> None:
+def test_matrix_compatible_check_rejects_deleted_changelog_line(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    changelog = tmp_path / "perf-changelog.yaml"
+    changelog.write_bytes(
+        b"- config-keys:\n"
+        b"  - config-a\n"
+        b"  description:\n"
+        b"    - Preserve this entry\n"
+        b"  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1798\n"
+    )
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    git("add", "perf-changelog.yaml")
+    git("commit", "-qm", "base")
+    git("tag", "base")
+    changelog.write_bytes(
+        b"- config-keys:\n"
+        b"  - config-a\n"
+        b"  description:\n"
+        b"    - Preserve this entry\n"
+    )
+    git("add", "perf-changelog.yaml")
+    git("commit", "-qm", "delete changelog entry")
+    git("tag", "head")
+    monkeypatch.chdir(tmp_path)
+
     with pytest.raises(
         ChangelogValidationError,
         match=r"Found deleted line: +pr-link: .*pull/1798",
     ):
-        validate_matrix_compatible_change(
-            "add33814cce15d0b71e3c98eca4bb2f7ad8aba96",
-            "60bf726a7f324a01e8850d228c8f0f7a6f203dbd",
-            "perf-changelog.yaml",
-        )
+        validate_matrix_compatible_change("base", "head", "perf-changelog.yaml")
