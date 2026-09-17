@@ -118,16 +118,48 @@ Required permissions (all of these endpoints require **admin access to the repos
    This creates `gharunner00/actions-runner` … `gharunner17/actions-runner` under the
    base directory, all sharing one downloaded tarball.
 
-5. Start the runners:
+5. Before starting runners in a network-restricted environment, place the two pinned Action
+   archives under `<BASE_DIR>/arch` (or pass the archive directory as the optional fifth
+   argument to `start_runners.sh`). The archive filenames may contain either the Action name
+   or its pinned SHA, and must contain the original Action package with `action.yml` and its
+   compiled `dist/` entry point:
+
+   ```text
+   actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+   actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+   ```
+
+   On every startup, `start_runners.sh` installs a missing package into each runner's
+   persistent cache at `_work/_actions/actions/<action>/<SHA>/`; a complete cache entry is
+   reused unchanged. This occurs before `run.sh`, so no workflow step needs network access to
+   download these Actions. When a workflow changes an Action SHA, stage its matching package
+   before restarting the runners.
+
+6. Start the runners:
 
    ```bash
    ./InferenceX/utils/runner_setup/start_runners.sh 0 13 ~/gharunners
    ```
 
+   For the supplied DCU host layout, this defaults to:
+
+   ```text
+   /stortest/lium_space/agentX/actions-runner/arch
+   ```
+
+   For one Runner installed directly at the supplied DCU path, preseed it without starting
+   or reconfiguring it by running:
+
+   ```bash
+   bash utils/runner_setup/preseed_actions.sh \
+     /stortest/lium_space/agentX/actions-runner \
+     /stortest/lium_space/agentX/actions-runner/arch
+   ```
+
    This (re)creates a tmux session (default name: `github-actions`) with one tiled pane
    per runner running `./run.sh`. Reattach later with `tmux attach -t github-actions`.
 
-6. Verify the runners show up as **Idle** on the
+7. Verify the runners show up as **Idle** on the
    [runners settings page](https://github.com/SemiAnalysisAI/InferenceX/settings/actions/runners),
    then register them in the repo config (see below).
 
