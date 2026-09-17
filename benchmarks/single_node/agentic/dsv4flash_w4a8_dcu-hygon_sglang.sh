@@ -340,15 +340,45 @@ stop_service() {
 }
 
 capture_server_metrics() {
-    local snapshot="$RESULT_DIR/sglang_metrics_$(date +%Y%m%dT%H%M%S).prom"
+    local max_attempts="${1:-6}"
+    local attempt
+    local snapshot
+    local diagnostic
+    local rc
+    local timestamp
 
-    curl -fsS "http://127.0.0.1:$PORT/metrics" >"$snapshot" 2>/dev/null || rm -f "$snapshot"
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        timestamp=$(date +%Y%m%dT%H%M%S)
+        snapshot="$RESULT_DIR/sglang_metrics_${timestamp}.prom"
+        diagnostic="$RESULT_DIR/sglang_metrics_${timestamp}.log"
+        echo "Checking SGLang metrics endpoint (attempt ${attempt}/${max_attempts}): http://127.0.0.1:$PORT/metrics"
+        if curl --fail --show-error --silent \
+            --connect-timeout 5 \
+            --max-time 15 \
+            --output "$snapshot" \
+            --write-out 'http_code=%{http_code} connect=%{time_connect}s total=%{time_total}s\n' \
+            "http://127.0.0.1:$PORT/metrics" >"$diagnostic" 2>&1; then
+            echo "Captured SGLang metrics snapshot: $snapshot"
+            rm -f "$diagnostic"
+            return 0
+        fi
+        rc=$?
+        rm -f "$snapshot"
+        echo "SGLang metrics request failed (attempt ${attempt}/${max_attempts}, curl_rc=$rc):" >&2
+        cat "$diagnostic" >&2 || true
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            sleep 10
+        fi
+    done
+
+    echo "ERROR: SGLang metrics endpoint did not become available after ${max_attempts} attempts; refusing to start AIPerf." >&2
+    return 1
 }
 
 cleanup() {
     local rc=$?
     trap - EXIT INT TERM
-    capture_server_metrics
+    capture_server_metrics 1 || true
     stop_service "$SERVER_PID" SGLang
     stop_service "$CLIENT_PID" Mooncake-client
     stop_service "$MASTER_PID" Mooncake-master
