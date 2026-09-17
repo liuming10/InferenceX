@@ -396,6 +396,14 @@ def test_changelog_validation_has_no_write_token_or_persisted_credential() -> No
     assert checkout["with"]["persist-credentials"] == "false"
 
 
+def test_setup_logs_and_publishes_generated_test_matrix() -> None:
+    workflow_text = (REPO_ROOT / ".github/workflows/run-sweep.yml").read_text()
+
+    assert 'echo "Generated test matrix:"' in workflow_text
+    assert "printf '%s\\n' \"$CONFIG_JSON\" | python3 -m json.tool" in workflow_text
+    assert 'echo "search-space-config=$CONFIG_JSON" >> "$GITHUB_OUTPUT"' in workflow_text
+
+
 def test_sweep_results_archive_locally_without_app_dispatch() -> None:
     workflow_text = (REPO_ROOT / ".github/workflows/run-sweep.yml").read_text()
     job = _WF["jobs"]["archive-sweep-results"]
