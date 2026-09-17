@@ -411,6 +411,24 @@ def test_benchmark_checkout_falls_back_to_the_read_only_workflow_token() -> None
     assert checkout["with"]["token"] == "${{ secrets.REPO_PAT || github.token }}"
 
 
+def test_benchmark_templates_preserve_unrelated_docker_containers() -> None:
+    single_node = (REPO_ROOT / ".github/workflows/benchmark-tmpl.yml").read_text()
+    multi_node = (REPO_ROOT / ".github/workflows/benchmark-multinode-tmpl.yml").read_text()
+
+    assert "# docker ps -aq | xargs -r docker rm -f" in single_node
+    assert "# docker network prune -f" in single_node
+    assert "# while [ -n \"$(docker ps -aq)\" ]; do" in single_node
+    assert "            docker ps -aq | xargs -r docker rm -f" not in single_node
+    assert "            docker network prune -f" not in single_node
+    assert "Skipping host-wide container and network cleanup." in single_node
+    assert 'scancel --user="$USER" --name="${{ runner.name }}"' in single_node
+    assert 'squeue --user="$USER" --name=' in single_node
+    assert 'scancel --name="${{ runner.name }}"' not in single_node
+    assert "host-wide Docker cleanup" in multi_node
+    assert "docker ps -aq | xargs -r docker rm -f" not in multi_node
+    assert "docker network prune -f" not in multi_node
+
+
 def test_setup_logs_and_publishes_generated_test_matrix() -> None:
     workflow_text = (REPO_ROOT / ".github/workflows/run-sweep.yml").read_text()
 

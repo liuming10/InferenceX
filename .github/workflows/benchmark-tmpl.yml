@@ -285,23 +285,26 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
           fi
 
-          # Cleanup Docker resources
+          # Do not remove every Docker container or prune host networks. This
+          # shared runner may host containers that do not belong to InferenceX.
+          # Keep the former commands here as documentation for an operator who
+          # deliberately restores all-container cleanup on an isolated runner.
           if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-            echo "[Docker] Cleaning up resources ..."
-            docker ps -aq | xargs -r docker rm -f
-            docker network prune -f
-            while [ -n "$(docker ps -aq)" ]; do
-              docker ps -a
-              sleep 5
-            done
+            echo "[Docker] Skipping host-wide container and network cleanup."
+            # docker ps -aq | xargs -r docker rm -f
+            # docker network prune -f
+            # while [ -n "$(docker ps -aq)" ]; do
+            #   docker ps -a
+            #   sleep 5
+            # done
           fi
 
-          # Cleanup SLURM resources
+          # Cleanup only this user's stale Slurm jobs for the current runner name.
           if command -v squeue >/dev/null 2>&1; then
-            echo "[Slurm] Cleaning up jobs with name: ${{ runner.name }} ..."
-            scancel --name="${{ runner.name }}" || true
-            while [ -n "$(squeue --name='${{ runner.name }}' --noheader --format='%i')" ]; do
-              squeue --name="${{ runner.name }}"
+            echo "[Slurm] Cleaning up this user's jobs named: ${{ runner.name }} ..."
+            scancel --user="$USER" --name="${{ runner.name }}" || true
+            while [ -n "$(squeue --user="$USER" --name='${{ runner.name }}' --noheader --format='%i')" ]; do
+              squeue --user="$USER" --name="${{ runner.name }}"
               sleep 5
             done
           fi
