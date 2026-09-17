@@ -340,7 +340,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
           clean: true
-          submodules: true
+          submodules: false
 
       - name: Launch job script
         env:
