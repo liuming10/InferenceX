@@ -1,15 +1,97 @@
-# Hygon C-3000 DCU single-node SGLang deployment. The checkpoint is staged on
-# the runner and must remain an absolute path; it is bind-mounted into Enroot at
-# the same location by runners/launch_dcu-hygon.sh.
+# 海光 C-3000 DCU 单节点 SGLang 部署。模型权重已预置在 Runner 主机，必须
+# 使用绝对路径；runners/launch_dcu-hygon.sh 会以相同路径将其 bind mount 到 Enroot。
 dsv4flash-w4a8-dcu-hygon-sglang:
-  image: 42.228.13.241:5000/jenkins/model_test_env/vllm:0.25.1-ubuntu22.04-dtk2604-py3.10-20260831-0300
+  image: 42.228.13.241:5000/jenkins/model_test_env/sglang:0.5.18-ubuntu22.04-dtk2604-py3.10-20260905-2100-xunfei-mc
   model: /ai_data/models/DeepSeek-V4-Flash-0731-W4A8-INT4-Channel-Attn-W8A8-INT8-Channel
   model-prefix: dsv4flash
-  runner: cluster:dcu-hygon
+  runner: dcu-hygon_00
   precision: w4a8
   framework: sglang
   multinode: false
   scenarios:
     agentic-coding:
     - search-space:
-      - { tp: 8, dp-attn: true, kv-offloading: none, conc-list: [32] }
+      # 单节点 AgentX search-space 可选参数。每个 YAML 映射代表一个独立的
+      # 矩阵组合；按需取消注释并新增组合，不要修改当前已验证的基线组合。
+      #
+      # `tp` 必须能被 `dcp-size` 整除。`pp`、`dcp-size`、`pcp-size` 默认均为
+      # 1；未设置的 `ep` 会在生成矩阵时按 1 处理。
+      # `spec-decoding` 仅支持：none、mtp、draft_model。
+      # - { tp: 8, pp: 1, dcp-size: 1, pcp-size: 1, ep: 1,
+      #     dp-attn: true, spec-decoding: none, kv-offloading: none,
+      #     conc-list: [1, 4, 16, 32] }
+      #
+      # `conc-list` 与 `conc-start` / `conc-end` 是两种互斥的并发声明方式。
+      # - { tp: 8, dp-attn: true, kv-offloading: none,
+      #     conc-start: 1, conc-end: 32 }
+      #
+      # DRAM KV 卸载须同时在本 `agentic-coding` 层设置 `dram-utilization`，
+      # 并在对应 search-space 组合中设置 `kv-offload-backend`。
+      # dram-utilization: 0.80
+      # - { tp: 8, dp-attn: true, kv-offloading: dram,
+      #     kv-offload-backend: { name: hicache }, conc-list: [32] }
+      #
+      # `router` 元数据可放在顶层（作用于全部组合）或各 search-space 组合中，
+      # 但不能两处同时配置；`version` 必须替换为实际验证过的组件版本。
+      # router: { name: sglang-router, version: "<已验证版本>" }
+      #
+      # master 配置 schema 不接受任意 SGLang CLI 参数，例如 `max-model-len`。
+      # 这类运行时参数由 DCU recipe 管理；当前 recipe 的默认 context length 为 1M。
+      - { tp: 8, dp-attn: true, kv-offloading: none, conc-list: [4] }
+
+# 多节点 AgentX 分离式（Prefill / Decode）完整参数示例。
+# 整段均为注释，不会生成任务；启用时应复制为新的顶层条目，并使用已验证的
+# 镜像、模型、集群 Runner 标签、组件版本、硬件名称和启动脚本。
+#
+# dsv4flash-w4a8-dcu-hygon-sglang-disagg:
+#   image: <已验证的 DCU SGLang 镜像>
+#   model: /ai_data/models/<已预置的模型目录>
+#   model-prefix: dsv4flash
+#   runner: cluster:<DCU 集群 Runner 标签>
+#   precision: w4a8
+#   framework: sglang-disagg
+#   multinode: true
+#   disagg: true
+#   # 分离式部署必须声明 KV 跨节点传输后端；顶层声明将作用于所有组合。
+#   kv-p2p-transfer: mooncake
+#   # router 也可移入每个 search-space 组合，但不能与顶层同时存在。
+#   router: { name: sglang-router, version: "<已验证版本>" }
+#   scenarios:
+#     agentic-coding:
+#     # 仅在某个组合使用 `kv-offloading: dram` 时需要；取值范围为 (0, 1]。
+#     - dram-utilization: 0.80
+#       search-space:
+#       - spec-decoding: none       # 可选：none、mtp、draft_model
+#         kv-offloading: dram       # 可选：none、dram
+#         kv-offload-backend:       # 仅 kv-offloading: dram 时必填
+#           name: hicache
+#           version: "<已验证版本>" # 可省略；不能填写镜像引用
+#         conc-list: [1, 4, 16, 32] # 或使用 conc-start 与 conc-end，二者不可混用
+#         # 分离式多节点必须同时包含 prefill 与 decode；不能使用 tp、worker 或 num-nodes。
+#         prefill:
+#           num-worker: 1
+#           tp: 8
+#           pp: 1
+#           dcp-size: 1
+#           pcp-size: 1
+#           ep: 1
+#           dp-attn: false
+#           hardware: <Prefill DCU 硬件标签>
+#           # 启动器支持的角色专属环境变量列表；仅填入该启动器实际识别的 KEY=VALUE。
+#           additional-settings:
+#           - "PREFILL_NODES=1"
+#         decode:
+#           num-worker: 1
+#           tp: 8
+#           pp: 1
+#           dcp-size: 1
+#           pcp-size: 1
+#           ep: 1
+#           dp-attn: true
+#           hardware: <Decode DCU 硬件标签>
+#           # prefill 与 decode 必须同时声明 hardware，或同时省略。
+#           additional-settings:
+#           - "DECODE_NODES=1"
+#
+# 对于 `multinode: true` 且 `disagg: false` 的聚合多节点模式，应改用 `worker`
+# 与 `num-nodes`，并删除 prefill、decode；不能与上述分离式字段混用。

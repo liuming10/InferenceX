@@ -396,6 +396,116 @@ def test_changelog_validation_has_no_write_token_or_persisted_credential() -> No
     assert checkout["with"]["persist-credentials"] == "false"
 
 
+def test_benchmark_checkout_falls_back_to_the_read_only_workflow_token() -> None:
+    workflow = yaml.load(
+        (REPO_ROOT / ".github/workflows/benchmark-tmpl.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    checkout = next(
+        step
+        for step in workflow["jobs"]["benchmark"]["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+
+    assert workflow["permissions"] == {"contents": "read"}
+    assert checkout["with"]["token"] == "${{ secrets.REPO_PAT || github.token }}"
+
+
+def test_benchmark_templates_preserve_unrelated_docker_containers() -> None:
+    single_node = (REPO_ROOT / ".github/workflows/benchmark-tmpl.yml").read_text()
+    multi_node = (REPO_ROOT / ".github/workflows/benchmark-multinode-tmpl.yml").read_text()
+
+    assert "# docker ps -aq | xargs -r docker rm -f" in single_node
+    assert "# docker network prune -f" in single_node
+    assert "# while [ -n \"$(docker ps -aq)\" ]; do" in single_node
+    assert "            docker ps -aq | xargs -r docker rm -f" not in single_node
+    assert "            docker network prune -f" not in single_node
+    assert "Skipping host-wide container and network cleanup." in single_node
+    assert 'scancel --user="$USER" --name="${{ runner.name }}"' in single_node
+    assert 'squeue --user="$USER" --name=' in single_node
+    assert 'scancel --name="${{ runner.name }}"' not in single_node
+    assert "host-wide Docker cleanup" in multi_node
+    assert "docker ps -aq | xargs -r docker rm -f" not in multi_node
+    assert "docker network prune -f" not in multi_node
+
+
+def test_dcu_launcher_mounts_hugging_face_cache_layers() -> None:
+    launcher = (REPO_ROOT / "runners/launch_dcu-hygon.sh").read_text()
+
+    assert 'HF_CACHE_ROOT_HOST_PATH="${HF_CACHE_ROOT_HOST_PATH:-/stortest/lium_space/agentX/actions-runner/huggingface}"' in launcher
+    assert 'HF_HUB_CACHE_HOST_PATH="${HF_HUB_CACHE_HOST_PATH:-$HF_CACHE_ROOT_HOST_PATH/hub}"' in launcher
+    assert 'HF_DATASETS_CACHE_HOST_PATH="${HF_DATASETS_CACHE_HOST_PATH:-$HF_CACHE_ROOT_HOST_PATH/datasets}"' in launcher
+    assert 'HF_HUB_CACHE="${HF_HUB_CACHE:-/mnt/hf_hub_cache}"' in launcher
+    assert 'HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/mnt/hf_datasets_cache}"' in launcher
+    assert '"$HF_HUB_CACHE_HOST_PATH:$HF_HUB_CACHE:none:x-create=dir,bind,ro"' in launcher
+    assert '"$HF_DATASETS_CACHE_HOST_PATH:$HF_DATASETS_CACHE:none:x-create=dir,bind,rw"' in launcher
+    assert 'Hugging Face hub cache is not readable: $HF_HUB_CACHE_HOST_PATH' in launcher
+    assert 'Hugging Face datasets cache is not readable/writable: $HF_DATASETS_CACHE_HOST_PATH' in launcher
+    assert 'RDMA_DEVICE_NAMES="${RDMA_DEVICE_NAMES:-shca_0,shca_1,shca_2,shca_3}"' in launcher
+    assert 'MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-$RDMA_DEVICE_NAMES}"' in launcher
+    assert 'RDMA_DEVICES_HOST_PATH="${RDMA_DEVICES_HOST_PATH:-/dev/infiniband}"' in launcher
+    assert 'RDMA_SYSFS_HOST_PATH="${RDMA_SYSFS_HOST_PATH:-/sys/class/infiniband}"' in launcher
+    assert 'Required RDMA HCA is unavailable: $RDMA_SYSFS_HOST_PATH/$rdma_device' in launcher
+    assert '"$RDMA_DEVICES_HOST_PATH:$RDMA_DEVICES_HOST_PATH:none:x-create=dir,rbind,rw"' in launcher
+    assert '"$RDMA_SYSFS_HOST_PATH:$RDMA_SYSFS_HOST_PATH:none:x-create=dir,rbind,ro"' in launcher
+    assert 'Mooncake DFS root is not container-${access}-accessible: $DFS_ROOT_DIR' in launcher
+    assert "env -u SHELLOPTS -u BASHOPTS -u BASH_ENV" in launcher
+    assert "-u 'BASH_FUNC_run_dcu_container%%' enroot \"$@\"" in launcher
+    assert 'bash -c "$(declare -f run_dcu_container); run_dcu_container"' in launcher
+    assert 'DFS_PROBE_NAME=.inferencex-dfs-probe-${container_name}' in launcher
+    assert 'mkdir "$dfs_probe"' in launcher
+    assert 'printf "inferencex-dfs-probe\\\\n" > "$dfs_probe/write-test"' in launcher
+    assert 'rm -rf -- "$dfs_probe"' in launcher
+    assert 'Mooncake preflight passed: DFS root is container-readable/writable/searchable' in launcher
+    assert '--env "MOONCAKE_DEVICE=$MOONCAKE_DEVICE"' in launcher
+
+
+def test_dcu_agentic_services_use_targeted_process_group_cleanup() -> None:
+    script = (
+        REPO_ROOT / "benchmarks/single_node/agentic/dsv4flash_w4a8_dcu-hygon_sglang.sh"
+    ).read_text()
+
+    assert 'setsid env "${SERVICE_ENV_UNSETS[@]}" "${MASTER_ENV[@]}" mooncake_master' in script
+    assert 'setsid env "${SERVICE_ENV_UNSETS[@]}" "${CLIENT_ENV[@]}" mooncake_client' in script
+    assert 'setsid env "${SERVICE_ENV_UNSETS[@]}" "${SGLANG_ENV[@]}" sglang serve "${SGLANG_ARGS[@]}"' in script
+    assert "SERVICE_ENV_NAMES=(" in script
+    assert 'SERVICE_ENV_UNSETS+=(-u "$service_env_name")' in script
+    assert "MASTER_ENV=(" in script
+    assert "CLIENT_ENV=(" in script
+    assert "SGLANG_ENV=(" in script
+    assert 'AIPERF_HTTP_TCP_USER_TIMEOUT' in script
+    assert '"AIPERF_HTTP_TCP_USER_TIMEOUT=$AIPERF_HTTP_TCP_USER_TIMEOUT"' not in script
+    assert 'export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-shca_0,shca_1,shca_2,shca_3}"' in script
+    assert 'export MC_STORE_CLIENT_METRIC="${MC_STORE_CLIENT_METRIC:-1}"' in script
+    assert 'export SGLANG_ROCM_USE_AITER_TILELANG_MHC="${SGLANG_ROCM_USE_AITER_TILELANG_MHC:-1}"' in script
+    assert 'export SGLANG_W4A8_TPMOE_BACKEND="${SGLANG_W4A8_TPMOE_BACKEND:-aiter}"' in script
+    assert 'export MOONCAKE_DFS_BATCH_READ_THREADS="${MOONCAKE_DFS_BATCH_READ_THREADS:-128}"' in script
+    assert 'export MC_STORE_DFS_H2D_KERNEL="${MC_STORE_DFS_H2D_KERNEL:-1}"' in script
+    assert '    --eviction_ratio=0.2 \\' in script
+    assert 'MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"' in script
+    assert 'CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-8}"' in script
+    assert '    --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS"' in script
+    assert '    --max-running-requests "$MAX_RUNNING_REQUESTS"' in script
+    assert 'unset PYTHONPYCACHEPREFIX' in script
+    assert '--protocol="$MOONCAKE_PROTOCOL"' in script
+    assert '--device_names="$MOONCAKE_DEVICE"' in script
+    assert 'kill -- "-$pgid"' in script
+    assert 'kill -KILL -- "-$pgid"' in script
+    assert 'stop_service "$SERVER_PID" SGLang' in script
+    assert 'stop_service "$CLIENT_PID" Mooncake-client' in script
+    assert 'stop_service "$MASTER_PID" Mooncake-master' in script
+    assert "pkill" not in script
+    assert "killall" not in script
+
+
+def test_setup_logs_and_publishes_generated_test_matrix() -> None:
+    workflow_text = (REPO_ROOT / ".github/workflows/run-sweep.yml").read_text()
+
+    assert 'echo "Generated test matrix:"' in workflow_text
+    assert "printf '%s\\n' \"$CONFIG_JSON\" | python3 -m json.tool" in workflow_text
+    assert 'echo "search-space-config=$CONFIG_JSON" >> "$GITHUB_OUTPUT"' in workflow_text
+
+
 def test_sweep_results_archive_locally_without_app_dispatch() -> None:
     workflow_text = (REPO_ROOT / ".github/workflows/run-sweep.yml").read_text()
     job = _WF["jobs"]["archive-sweep-results"]
@@ -406,6 +516,9 @@ def test_sweep_results_archive_locally_without_app_dispatch() -> None:
     assert "ingest-agentic-results" not in workflow_text
     assert job["runs-on"] == "dcu-hygon_00"
     assert job["env"]["ARCHIVE_ROOT"] == "/stortest/lium_space/agentX/InferenceX_result"
+    assert "json.loads(os.environ.get('NEEDS_JSON') or '{}')" in workflow_text
+    assert "matrix = json.loads(matrix_raw) if matrix_raw else {}" in workflow_text
+    assert "'matrix-generated': bool(matrix)" in workflow_text
     assert "upload-changelog-metadata" in job["needs"]
     assert "calc-success-rate" in job["needs"]
     assert any(
