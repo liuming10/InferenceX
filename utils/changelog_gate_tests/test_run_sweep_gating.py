@@ -449,6 +449,8 @@ def test_dcu_launcher_mounts_hugging_face_cache_layers() -> None:
     assert '"$RDMA_DEVICES_HOST_PATH:$RDMA_DEVICES_HOST_PATH:none:x-create=dir,rbind,rw"' in launcher
     assert '"$RDMA_SYSFS_HOST_PATH:$RDMA_SYSFS_HOST_PATH:none:x-create=dir,rbind,ro"' in launcher
     assert 'Mooncake DFS root is not container-${access}-accessible: $DFS_ROOT_DIR' in launcher
+    assert "env -u SHELLOPTS -u BASHOPTS -u BASH_ENV" in launcher
+    assert "-u 'BASH_FUNC_run_dcu_container%%' enroot \"$@\"" in launcher
     assert 'bash -c "$(declare -f run_dcu_container); run_dcu_container"' in launcher
     assert 'DFS_PROBE_NAME=.inferencex-dfs-probe-${container_name}' in launcher
     assert 'mkdir "$dfs_probe"' in launcher

@@ -193,11 +193,13 @@ run_dcu_container() {
 
     local safe_image squash_file lock_file container_name
 
-    # Enroot 会在容器移除时执行自己的 environment hook。来自较早 runner shell
-    # 的导出 Bash 函数可能在该 hook 中被重新解释，因此每一次 Enroot 调用前都
-    # 移除本 launcher 可能遗留的函数环境变量。
+    # Enroot 通过 SHELLOPTS 把调用者的 Bash 选项传给其 runtime shell。launcher
+    # 启用了 nounset，但 Enroot 生成的 environment 文件允许含延迟变量展开的值；
+    # 在中断清理时以 nounset 加载该文件会使可选变量变成致命错误。Enroot 自身不
+    # 需要继承 launcher 的 shell 选项或导出的函数，因此只在 Enroot 子进程中移除它们。
     run_enroot() {
-        env -u 'BASH_FUNC_run_dcu_container%%' enroot "$@"
+        env -u SHELLOPTS -u BASHOPTS -u BASH_ENV \
+            -u 'BASH_FUNC_run_dcu_container%%' enroot "$@"
     }
 
     # 将 registry/image:tag 转换为共享 SquashFS 缓存中的安全文件名。
