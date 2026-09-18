@@ -429,20 +429,18 @@ def test_benchmark_templates_preserve_unrelated_docker_containers() -> None:
     assert "docker network prune -f" not in multi_node
 
 
-def test_dcu_launcher_mounts_read_only_hugging_face_cache_layers() -> None:
+def test_dcu_launcher_mounts_hugging_face_cache_layers() -> None:
     launcher = (REPO_ROOT / "runners/launch_dcu-hygon.sh").read_text()
 
-    assert 'HF_CACHE_ROOT_HOST_PATH="${HF_CACHE_ROOT_HOST_PATH:-/ai_data/datasets/huggingface}"' in launcher
+    assert 'HF_CACHE_ROOT_HOST_PATH="${HF_CACHE_ROOT_HOST_PATH:-/stortest/lium_space/agentX/actions-runner/huggingface}"' in launcher
     assert 'HF_HUB_CACHE_HOST_PATH="${HF_HUB_CACHE_HOST_PATH:-$HF_CACHE_ROOT_HOST_PATH/hub}"' in launcher
     assert 'HF_DATASETS_CACHE_HOST_PATH="${HF_DATASETS_CACHE_HOST_PATH:-$HF_CACHE_ROOT_HOST_PATH/datasets}"' in launcher
     assert 'HF_HUB_CACHE="${HF_HUB_CACHE:-/mnt/hf_hub_cache}"' in launcher
     assert 'HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/mnt/hf_datasets_cache}"' in launcher
     assert '"$HF_HUB_CACHE_HOST_PATH:$HF_HUB_CACHE:none:x-create=dir,bind,ro"' in launcher
-    assert '"$HF_DATASETS_CACHE_HOST_PATH:$HF_DATASETS_CACHE:none:x-create=dir,bind,ro"' in launcher
-    assert '--env "HF_HUB_CACHE=$HF_HUB_CACHE"' in launcher
-    assert '--env "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"' in launcher
-    assert '--env "HF_HUB_OFFLINE=1"' in launcher
-    assert 'Hugging Face cache is not readable: $cache_dir' in launcher
+    assert '"$HF_DATASETS_CACHE_HOST_PATH:$HF_DATASETS_CACHE:none:x-create=dir,bind,rw"' in launcher
+    assert 'Hugging Face hub cache is not readable: $HF_HUB_CACHE_HOST_PATH' in launcher
+    assert 'Hugging Face datasets cache is not readable/writable: $HF_DATASETS_CACHE_HOST_PATH' in launcher
     assert 'RDMA_DEVICE_NAMES="${RDMA_DEVICE_NAMES:-shca_0,shca_1,shca_2,shca_3}"' in launcher
     assert 'MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-$RDMA_DEVICE_NAMES}"' in launcher
     assert 'RDMA_DEVICES_HOST_PATH="${RDMA_DEVICES_HOST_PATH:-/dev/infiniband}"' in launcher
