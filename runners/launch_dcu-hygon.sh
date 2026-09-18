@@ -16,6 +16,69 @@
 
 set -euo pipefail
 
+# 多节点工作流仍按 runner 名称调用本入口；显式转交给独立的
+# Slurm/Enroot/SGLang 多节点实现，避免把多节点变量误送入单机 recipe。
+if [[ "${IS_MULTINODE:-false}" == "true" ]]; then
+    exec bash "$(dirname "${BASH_SOURCE[0]}")/launch_multi_dcu-hygon.sh" "$@"
+fi
+
+# DCU master 配置通过 workflow 的 environment 传入本脚本；本脚本不直接解析
+# configs/dcu-master.yaml。下面按“已接入单机启动链路”和“当前单机未使用”列出
+# 参数，便于核对 master 配置 -> matrix -> workflow -> launcher 的传递关系。
+#
+# workflow 传入并由本 launcher 可取得的参数（srun --export=ALL）：
+#   顶层：IMAGE MODEL MODEL_PREFIX RUNNER_NAME PRECISION FRAMEWORK
+#   单机拓扑：TP PP_SIZE DCP_SIZE PCP_SIZE EP_SIZE DP_ATTENTION
+#   负载：CONC SPEC_DECODING KV_OFFLOADING KV_OFFLOAD_BACKEND
+#   场景：SCENARIO_TYPE SCENARIO_SUBDIR IS_AGENTIC DURATION MAX_MODEL_LEN
+#   结果/评测：RESULT_DIR RESULT_FILENAME EVAL_ONLY RUN_EVAL EVAL_LIMIT
+#   其他：REQUIRE_POWER KV_OFFLOAD_BACKEND_METADATA ROUTER_METADATA KV_P2P_TRANSFER
+#           TOTAL_CPU_DRAM_GB DISAGG
+#
+# 当前单机 dcu-hygon + sglang 链路实际传入 benchmark recipe 的参数：
+#   MODEL MODEL_PREFIX TP PP_SIZE PCP_SIZE EP_SIZE DP_ATTENTION CONC
+#   KV_OFFLOADING TOTAL_CPU_DRAM_GB DURATION RESULT_DIR RESULT_FILENAME
+#   EVAL_ONLY RUN_EVAL SCENARIO_TYPE SCENARIO_SUBDIR IS_AGENTIC
+#   AIPERF_FAILED_REQUEST_THRESHOLD AIPERF_EXPERIMENTAL_FAST
+#
+# 当前 launcher/recipe 不使用的参数（保留为注释，不能据此启用多节点能力）：
+#   DCP_SIZE        -> 当前单机 recipe 没有对应 SGLang 参数
+#   SPEC_DECODING   -> 当前 recipe 未实现 speculative decoding
+#   MAX_MODEL_LEN   -> 当前值由 recipe 默认 context length 管理，未从 launcher 转发
+#   KV_OFFLOAD_BACKEND / KV_OFFLOAD_BACKEND_METADATA
+#                   -> 当前 recipe 未将 backend metadata 转成运行参数
+#   ROUTER_METADATA -> 单机启动器没有 router 进程
+#   KV_P2P_TRANSFER -> 仅多节点 disagg 链路使用
+#   DRAM_UTILIZATION-> 当前单机 recipe 未实现 DRAM KV offload
+#   DISAGG          -> 单机 launcher 不启动 disaggregated topology
+#   PREFILL/DECODE/WORKER/NUM_NODES/HARDWARE/ADDITIONAL_SETTINGS
+#                   -> 多节点 topology，不能用于本单机 launcher
+#
+# benchmark-multinode-tmpl.yml 导出的环境变量；IS_MULTINODE=true 时由本入口
+# 转交给 launch_dcu_multi_hygon.sh，下面的多节点变量不会送入单机 recipe：
+#   任务标记：
+#     IS_MULTINODE=true
+#   基础配置：
+#     EXP_NAME RECIPE_FINGERPRINT IMAGE MODEL MODEL_PREFIX FRAMEWORK PRECISION
+#     ISL OSL MAX_MODEL_LEN DISAGG SCENARIO_TYPE SCENARIO_SUBDIR IS_AGENTIC
+#   并发与运行控制：
+#     CONC CONC_LIST DURATION SPEC_DECODING
+#   Prefill 角色：
+#     PREFILL_HARDWARE PREFILL_NUM_WORKERS PREFILL_TP PREFILL_PP_SIZE
+#     PREFILL_DCP_SIZE PREFILL_PCP_SIZE PREFILL_EP PREFILL_DP_ATTN
+#   Decode 角色：
+#     DECODE_HARDWARE DECODE_NUM_WORKERS DECODE_TP DECODE_PP_SIZE
+#     DECODE_DCP_SIZE DECODE_PCP_SIZE DECODE_EP DECODE_DP_ATTN
+#   组件与 KV 设置：
+#     KV_OFFLOADING KV_OFFLOAD_BACKEND KV_OFFLOAD_BACKEND_METADATA
+#     ROUTER_METADATA KV_P2P_TRANSFER TOTAL_CPU_DRAM_GB
+#   评测与产物：
+#     RUN_EVAL EVAL_ONLY EVAL_FRAMEWORK EVAL_SUITE EVAL_CONC EVAL_LIMIT
+#     SWEBENCH_GEN_MODE REQUIRE_POWER POWER_PRODUCER_SHA RESULT_FILENAME
+#   其他 workflow 环境：
+#     HF_TOKEN PYTHONDONTWRITEBYTECODE PYTHONPYCACHEPREFIX SWEBENCH_USE_MODAL
+#     MODAL_TOKEN_ID MODAL_TOKEN_SECRET
+#
 # 必填的 workflow 输入参数。
 # IMAGE：宿主机 Docker daemon 中已有的镜像；将被缓存为 .sqsh。
 # MODEL：checkpoint 的绝对路径；在容器中以相同路径只读挂载。
@@ -274,10 +337,14 @@ run_dcu_container() {
         "$container_name" bash "$DCU_BENCHMARK_SCRIPT"
 }
 
-export -f run_dcu_container
+# export -f run_dcu_container
 
-# 提交一个独占的单节点 Slurm step。--export=ALL 保留所有 workflow 变量；
-# 显式列出 ENROOT_RUNTIME_PATH 以增强清晰度并确保跨 Slurm 环境传递。
+# 提交一个独占的单节点 Slurm step。不要使用 export -f：导出的函数会以
+# BASH_FUNC_run_dcu_container%% 进入 Enroot 的 environment hook；该 hook 在
+# 中断清理时重新展开函数体，可能因 container_name 是局部变量而触发 nounset。
+# 直接把函数定义作为 bash 命令传给 srun，既保留 Slurm 子 shell 的执行能力，
+# 又不把函数定义放进 Enroot 的环境变量。
+
 srun \
     --partition="$DCU_PARTITION" \
     --gres="dcu:${DCU_COUNT}" \
@@ -286,4 +353,4 @@ srun \
     --time="$DCU_TIME_LIMIT" \
     --job-name="${RUNNER_NAME:-dcu-hygon}" \
     --export=ALL,ENROOT_RUNTIME_PATH \
-    bash -c run_dcu_container
+    bash -c "$(declare -f run_dcu_container); run_dcu_container"
