@@ -435,7 +435,7 @@ SGLANG_ARGS=(
     --model-path "$MODEL"
     --model-loader-extra-config '{"enable_multithread_load":"true","num_threads":64}'
     --trust-remote-code
-    --context-length "${MAX_MODEL_LEN:-131072}"
+    --context-length "${MAX_MODEL_LEN:-1048576}"
     --chunked-prefill-size 32768
     --disable-flashinfer-autotune
     --skip-server-warmup
