@@ -193,6 +193,13 @@ run_dcu_container() {
 
     local safe_image squash_file lock_file container_name
 
+    # Enroot 会在容器移除时执行自己的 environment hook。来自较早 runner shell
+    # 的导出 Bash 函数可能在该 hook 中被重新解释，因此每一次 Enroot 调用前都
+    # 移除本 launcher 可能遗留的函数环境变量。
+    run_enroot() {
+        env -u 'BASH_FUNC_run_dcu_container%%' enroot "$@"
+    }
+
     # 将 registry/image:tag 转换为共享 SquashFS 缓存中的安全文件名。
     safe_image=$(printf '%s' "$IMAGE" | sed 's#[/:@#]#_#g')
     squash_file="$SQUASH_CACHE_DIR/${safe_image}.sqsh"
@@ -216,13 +223,13 @@ run_dcu_container() {
     if ! unsquashfs -l "$squash_file" >/dev/null 2>&1; then
         rm -f "$squash_file"
         echo "Importing local Docker image into $squash_file"
-        enroot import -o "$squash_file" "dockerd://$IMAGE"
+        run_enroot import -o "$squash_file" "dockerd://$IMAGE"
     fi
     flock -u 9
 
     # 无论成功、报错、中断或被终止，都清理 Enroot 容器元数据。
     cleanup_container() {
-        enroot remove -f "$container_name" >/dev/null 2>&1 || true
+        run_enroot remove -f "$container_name" >/dev/null 2>&1 || true
     }
     trap cleanup_container EXIT INT TERM
 
@@ -237,12 +244,12 @@ run_dcu_container() {
 
     # 删除此前中断运行遗留的元数据，再由已校验的共享 SquashFS 镜像创建新的
     # 可写 Enroot 容器。
-    enroot remove -f "$container_name" >/dev/null 2>&1 || true
-    enroot create --name "$container_name" "$squash_file"
+    run_enroot remove -f "$container_name" >/dev/null 2>&1 || true
+    run_enroot create --name "$container_name" "$squash_file"
 
     # 在实际容器身份中确认 Mooncake 所需的 RDMA 发现路径和 DFS 权限。DFS
     # probe 只会创建、读取并删除一个由本次容器 ID 唯一限定的临时目录与文件。
-    enroot start --root --rw \
+    run_enroot start --root --rw \
         --mount "$DFS_ROOT_DIR:$DFS_ROOT_DIR:none:x-create=dir,bind,rw" \
         --mount "$RDMA_DEVICES_HOST_PATH:$RDMA_DEVICES_HOST_PATH:none:x-create=dir,rbind,rw" \
         --mount "$RDMA_SYSFS_HOST_PATH:$RDMA_SYSFS_HOST_PATH:none:x-create=dir,rbind,ro" \
@@ -293,7 +300,7 @@ run_dcu_container() {
     #
     # 下方环境变量按用途划分：端点/模型、并行参数、AgentX 负载与结果、
     # 场景/评测设置、AIPerf 失败策略，以及 Mooncake DFS 路径。
-    enroot start --root --rw \
+    run_enroot start --root --rw \
         --mount "$GITHUB_WORKSPACE:/workspace:none:x-create=dir,bind,rw" \
         --mount "$MODEL:$MODEL:none:x-create=dir,bind,ro" \
         --mount "$DFS_ROOT_DIR:$DFS_ROOT_DIR:none:x-create=dir,bind,rw" \
