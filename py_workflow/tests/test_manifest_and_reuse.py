@@ -5,11 +5,12 @@ from pathlib import Path
 
 import pytest
 
+import py_workflow.manifest as manifest_module
 from py_workflow.benchmark_multinode_tmpl import execute_multinode
 from py_workflow.benchmark_tmpl import execute_single_node
 from py_workflow.manifest import (
     Project, WorkflowError, artifact_inventory, atomic_json, make_manifest,
-    matrix_digest, verify_inventory,
+    matrix_digest, resolve_project, verify_inventory,
 )
 from py_workflow.reuse import decide_reuse
 from py_workflow.run_sweep import options, parser
@@ -34,6 +35,81 @@ def successful_archive(tmp_path: Path, current: Project, matrix: list[dict]) -> 
     manifest["artifacts"] = artifact_inventory(archive / "artifacts")
     atomic_json(archive / "archive_manifest.json", manifest)
     return archive
+
+
+def test_resolve_project_skips_submodule_validation_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    calls: list[str] = []
+
+    monkeypatch.setattr(manifest_module, "git_output", lambda _root, *args: {
+        ("rev-parse", "--is-inside-work-tree"): "true",
+        ("rev-parse", "HEAD"): "a" * 40,
+        ("status", "--porcelain"): "",
+    }[args])
+    monkeypatch.setattr(manifest_module, "run", lambda *_args, **_kwargs: type("Result", (), {"stdout": ""})())
+    monkeypatch.setattr(manifest_module, "venv_python", lambda root: root / ".venv/bin/python")
+    monkeypatch.setattr(manifest_module, "verify_python", lambda *_args: None)
+    monkeypatch.setattr(manifest_module, "ensure_initialized_submodules", lambda _root: calls.append("checked"))
+
+    resolve_project(
+        project_dir=project_dir, workspace_root=tmp_path / "worktrees", repository=None,
+        ref="HEAD", allow_dirty=False, validate_submodules=False,
+    )
+
+    assert calls == []
+
+
+def test_resolve_project_skips_submodule_validation_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    calls: list[str] = []
+
+    monkeypatch.setattr(manifest_module, "git_output", lambda _root, *args: {
+        ("rev-parse", "--is-inside-work-tree"): "true",
+        ("rev-parse", "HEAD"): "a" * 40,
+        ("status", "--porcelain"): "",
+    }[args])
+    monkeypatch.setattr(manifest_module, "run", lambda *_args, **_kwargs: type("Result", (), {"stdout": ""})())
+    monkeypatch.setattr(manifest_module, "venv_python", lambda root: root / ".venv/bin/python")
+    monkeypatch.setattr(manifest_module, "verify_python", lambda *_args: None)
+    monkeypatch.setattr(manifest_module, "ensure_initialized_submodules", lambda _root: calls.append("checked"))
+
+    resolve_project(
+        project_dir=project_dir, workspace_root=tmp_path / "worktrees", repository=None,
+        ref="HEAD", allow_dirty=False, validate_submodules=False,
+    )
+
+    assert calls == []
+
+
+def test_resolve_project_can_validate_submodules_explicitly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    calls: list[str] = []
+
+    monkeypatch.setattr(manifest_module, "git_output", lambda _root, *args: {
+        ("rev-parse", "--is-inside-work-tree"): "true",
+        ("rev-parse", "HEAD"): "a" * 40,
+        ("status", "--porcelain"): "",
+    }[args])
+    monkeypatch.setattr(manifest_module, "run", lambda *_args, **_kwargs: type("Result", (), {"stdout": ""})())
+    monkeypatch.setattr(manifest_module, "venv_python", lambda root: root / ".venv/bin/python")
+    monkeypatch.setattr(manifest_module, "verify_python", lambda *_args: None)
+    monkeypatch.setattr(manifest_module, "ensure_initialized_submodules", lambda _root: calls.append("checked"))
+
+    resolve_project(
+        project_dir=project_dir, workspace_root=tmp_path / "worktrees", repository=None,
+        ref="HEAD", allow_dirty=False, validate_submodules=True,
+    )
+
+    assert calls == ["checked"]
 
 
 def test_matrix_digest_is_order_stable_for_mapping_keys() -> None:

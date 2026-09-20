@@ -291,7 +291,7 @@ def stage_job_output(job_dir: Path, artifact_root: Path, entry: dict[str, Any], 
         copy_workflow_paths(power, [
             "results/gpu_metrics*.csv", "results/gpu_metrics*_context.json",
             "results/gpu_metrics_identity.json", "results/agentic_power_window.json",
-            "results/power_validation.json",
+            "results/agentic_power_timezone_offset.txt", "results/power_validation.json",
         ])
     return included
 

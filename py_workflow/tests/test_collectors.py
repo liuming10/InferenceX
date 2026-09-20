@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -21,10 +22,14 @@ def test_collect_results_includes_fixed_and_agentx_artifacts(
     (fixed / "fixed.json").write_text('{"kind": "fixed"}', encoding="utf-8")
     (agentic / "agentx.json").write_text('{"kind": "agentx"}', encoding="utf-8")
     aggregates = tmp_path / "aggregates"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
     observed: dict[str, Path] = {}
 
     def fake_run(command, **kwargs):
         observed["input"] = Path(command[-2])
+        observed["cwd"] = Path(kwargs["cwd"])
+        observed["pythonpath"] = Path(kwargs["env"]["PYTHONPATH"].split(os.pathsep)[0])
         payload = []
         for path in observed["input"].rglob("*.json"):
             payload.append(json.loads(path.read_text(encoding="utf-8")))
@@ -34,9 +39,12 @@ def test_collect_results_includes_fixed_and_agentx_artifacts(
     monkeypatch.setattr("py_workflow.collect_results.subprocess.run", fake_run)
     output = collect_results(
         python=tmp_path / "python", artifacts=artifacts, aggregates=aggregates,
+        project_root=project_root,
     )
 
     assert output == aggregates / "agg_bmk.json"
+    assert observed["cwd"] == aggregates
+    assert observed["pythonpath"] == project_root
     assert sorted(path.name for path in observed["input"].iterdir()) == [
         "bmk_agentic_agentx", "bmk_fixed",
     ]

@@ -5,7 +5,7 @@ dsv4flash-w4a8-dcu-hygon-sglang:
   model: /ai_data/models/DeepSeek-V4-Flash-0731-W4A8-INT4-Channel-Attn-W8A8-INT8-Channel
   model-prefix: dsv4flash
   runner: dcu-hygon_00
-  precision: w4a8
+  precision: int4
   framework: sglang
   multinode: false
   scenarios:
@@ -37,7 +37,7 @@ dsv4flash-w4a8-dcu-hygon-sglang:
       #
       # master 配置 schema 不接受任意 SGLang CLI 参数，例如 `max-model-len`。
       # 这类运行时参数由 DCU recipe 管理；当前 recipe 的默认 context length 为 1M。
-      - { tp: 8, dp-attn: true, kv-offloading: none, conc-list: [4] }
+      - { tp: 8, dp-attn: true, kv-offloading: none, conc-list: [1] }
 
 # 多节点 AgentX 分离式（Prefill / Decode）完整参数示例。
 # 整段均为注释，不会生成任务；启用时应复制为新的顶层条目，并使用已验证的

@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +23,91 @@ def _value(entry: dict[str, Any], key: str, default: Any = "") -> Any:
     return entry.get(key, default)
 
 
+def _progress(message: str) -> None:
+    timestamp = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+    print(f"[{timestamp}] [agentx] {message}", flush=True)
+
+
+def _redacted_command(command: list[str]) -> str:
+    redacted: list[str] = []
+    redact_next = False
+    for value in command:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+        elif value.lower() in {"--api-key", "--token", "--password"}:
+            redacted.append(value)
+            redact_next = True
+        else:
+            redacted.append(value)
+    return shlex.join(redacted)
+
+
+def write_agentx_power_timezone_offset(result_dir: Path) -> Path:
+    """Record the local offset used for AIPerf's naive profile timestamps."""
+    path = result_dir / "agentic_power_timezone_offset.txt"
+    path.write_text(datetime.now().astimezone().strftime("%z") + "\n", encoding="utf-8")
+    return path
+
+
+def capture_endpoint_metrics(
+    *, metrics_url: str | None, result_dir: Path, framework: str, phase: str,
+) -> dict[str, Any]:
+    """Save an externally managed endpoint's Prometheus response unchanged."""
+    captured_at = datetime.now(timezone.utc)
+    record: dict[str, Any] = {
+        "phase": phase,
+        "source_url": metrics_url,
+        "captured_at": captured_at.isoformat(),
+        "status": "skipped" if not metrics_url else "failure",
+    }
+    if not metrics_url:
+        return record
+
+    safe_framework = re.sub(r"[^a-z0-9_.-]+", "-", framework.lower()).strip(".-") or "server"
+    timestamp = captured_at.strftime("%Y%m%dT%H%M%S%fZ")
+    destination = result_dir / f"{safe_framework}_metrics_{timestamp}.prom"
+    temporary: Path | None = None
+    try:
+        with urllib.request.urlopen(metrics_url, timeout=15) as response:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=result_dir, prefix=f".{destination.name}.", delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                while chunk := response.read(1024 * 1024):
+                    output.write(chunk)
+        temporary.replace(destination)
+        record.update({"status": "success", "path": destination.name})
+        _progress(f"captured {safe_framework} metrics ({phase}): {destination}")
+    except (OSError, urllib.error.URLError, ValueError) as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        record["error"] = str(error)
+        _progress(f"metrics capture skipped ({phase}): {error}")
+    return record
+
+
+def runtime_environment_overrides(
+    hf_cache_dir: Path, dataset_configuration_timeout: int,
+) -> dict[str, str]:
+    """Return offline cache and AIPerf configuration environment overrides."""
+    timeout = str(dataset_configuration_timeout)
+    return {
+        "HF_HOME": str(hf_cache_dir),
+        "HF_DATASETS_CACHE": str(hf_cache_dir / "datasets"),
+        "HF_HUB_CACHE": str(hf_cache_dir / "hub"),
+        "HF_HUB_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "AIPERF_DATASET_CONFIGURATION_TIMEOUT": timeout,
+        "AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT": timeout,
+        "AIPERF_UI_REALTIME_METRICS_ENABLED": "true",
+    }
+
+
 def build_runtime_context(
     entry: dict[str, Any], *, project: Project, stem: str, server_url: str,
     metrics_url: str | None, github: dict[str, Any], job_dir: Path,
+    hf_cache_dir: Path, dataset_configuration_timeout: int,
 ) -> dict[str, Any]:
     """Construct the CI/launcher context retained without starting services."""
     prefill = entry.get("prefill") or {}
@@ -68,6 +155,11 @@ def build_runtime_context(
             "NUM_NODES": None, "DCU_COUNT": None, "SLURM_PARTITION": None,
             "ENROOT_IMAGE": str(_value(entry, "image")),
         },
+        "endpoint_metrics": {
+            "source_url": metrics_url,
+            "service_managed_by_workflow": False,
+            "captures": [],
+        },
         "agentx_parameters": {
             "RESULT_DIR": str(job_dir / "results"), "RESULT_FILENAME": stem,
             "AIPERF_SERVER_URL": server_url, "AIPERF_METRICS_URL": metrics_url,
@@ -78,6 +170,11 @@ def build_runtime_context(
             "TRACE_IDLE_GAP_CAP_SECONDS": int(os.environ.get("AIPERF_TRACE_IDLE_GAP_CAP_SECONDS", "300")),
             "WARMUP_GRACE_PERIOD": int(os.environ.get("AGENTIC_WARMUP_GRACE_PERIOD", "1800")),
             "NO_GPU_TELEMETRY": True, "DATASET_ENTRIES": 393, "SLICE_DURATION": 1.0,
+            "REALTIME_METRICS_ENABLED": True, "STATS_INTERVAL": 30,
+            "HF_CACHE_DIR": str(hf_cache_dir),
+            "HF_HUB_OFFLINE": True, "HF_DATASETS_OFFLINE": True,
+            "DATASET_CONFIGURATION_TIMEOUT": dataset_configuration_timeout,
+            "PROFILE_CONFIGURE_TIMEOUT": dataset_configuration_timeout,
         },
     }
 
@@ -172,7 +269,8 @@ def run_agentx(
     server_url: str, aiperf_cli: str, tokenizer: str | None, duration: int,
     dataset_loader: str, served_model_name: str | None, metrics_url: str | None,
     warmup_requests_per_lane: int, failed_request_threshold: float, fast: bool,
-    env_overrides: dict[str, str], github: dict[str, Any],
+    env_overrides: dict[str, str], github: dict[str, Any], hf_cache_dir: Path,
+    dataset_configuration_timeout: int,
 ) -> tuple[list[str], subprocess.CompletedProcess[str], dict[str, str]]:
     result_dir = job_dir / "results"
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -194,7 +292,10 @@ def run_agentx(
     context = build_runtime_context(
         entry, project=project, stem=stem, server_url=server_url,
         metrics_url=metrics_url, github=github, job_dir=job_dir,
+        hf_cache_dir=hf_cache_dir,
+        dataset_configuration_timeout=dataset_configuration_timeout,
     )
+    captures = context["endpoint_metrics"]["captures"]
     context_json = json.dumps(context, indent=2, sort_keys=True, default=str) + "\n"
     (job_dir / "runtime_context.json").write_text(context_json, encoding="utf-8")
     (result_dir / "runtime_context.json").write_text(context_json, encoding="utf-8")
@@ -204,9 +305,51 @@ def run_agentx(
     env_json = json.dumps(safe_env, indent=2, sort_keys=True) + "\n"
     (job_dir / "meta_env.json").write_text(env_json, encoding="utf-8")
     (result_dir / "meta_env.json").write_text(env_json, encoding="utf-8")
-    (job_dir / "benchmark_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
-    completed = subprocess.run(command, cwd=project.root, env=env, text=True, capture_output=True)
-    (job_dir / "benchmark.log").write_text(completed.stdout + completed.stderr, encoding="utf-8")
+    (result_dir / "benchmark_command.txt").write_text(
+        shlex.join(command) + "\n", encoding="utf-8",
+    )
+    write_agentx_power_timezone_offset(result_dir)
+    captures.append(capture_endpoint_metrics(
+        metrics_url=metrics_url, result_dir=result_dir,
+        framework=str(_value(entry, "framework", "server")), phase="before-benchmark",
+    ))
+    context_json = json.dumps(context, indent=2, sort_keys=True, default=str) + "\n"
+    (job_dir / "runtime_context.json").write_text(context_json, encoding="utf-8")
+    (result_dir / "runtime_context.json").write_text(context_json, encoding="utf-8")
+    job_log = job_dir / "benchmark.log"
+    artifact_log = result_dir / "benchmark.log"
+    _progress(f"running AIPerf; logs={job_log}, {artifact_log}")
+    _progress(f"command: {_redacted_command(command)}")
+    output: list[str] = []
+    returncode = 1
+    try:
+        with (
+            job_log.open("w", encoding="utf-8") as job_log_file,
+            artifact_log.open("w", encoding="utf-8") as artifact_log_file,
+        ):
+            process = subprocess.Popen(
+                command, cwd=project.root, env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                output.append(line)
+                job_log_file.write(line)
+                job_log_file.flush()
+                artifact_log_file.write(line)
+                artifact_log_file.flush()
+                print(f"[agentx] {line}", end="", flush=True)
+            returncode = process.wait()
+    finally:
+        captures.append(capture_endpoint_metrics(
+            metrics_url=metrics_url, result_dir=result_dir,
+            framework=str(_value(entry, "framework", "server")), phase="after-benchmark",
+        ))
+        context_json = json.dumps(context, indent=2, sort_keys=True, default=str) + "\n"
+        (job_dir / "runtime_context.json").write_text(context_json, encoding="utf-8")
+        (result_dir / "runtime_context.json").write_text(context_json, encoding="utf-8")
+    completed = subprocess.CompletedProcess(command, returncode, "".join(output), "")
+    _progress(f"AIPerf exited with status {returncode}")
     return command, completed, env
 
 
@@ -219,12 +362,16 @@ def process_outputs(project: Project, job_dir: Path, stem: str, env: dict[str, s
         [python, "-m", "infx.results.agentic.analyze_benchmark_distributions", str(result_dir / "aiperf_artifacts"), "-o", str(result_dir)],
     ]
     for command in commands:
+        _progress(f"processing output: {shlex.join(command)}")
         completed = subprocess.run(command, cwd=project.root, env=env, text=True, capture_output=True)
         if completed.returncode:
-            raise WorkflowError(completed.stderr.strip() or completed.stdout.strip() or f"command failed: {command[1]}")
+            detail = completed.stderr.strip() or completed.stdout.strip() or f"command failed: {command[1]}"
+            _progress(f"output processing failed: {detail}")
+            raise WorkflowError(detail)
     result = job_dir / f"{stem}.json"
     if not result.is_file():
         raise WorkflowError(f"AgentX result was not generated: {result}")
+    _progress(f"result processing complete: {result}")
 
 
 def execute(
@@ -232,7 +379,7 @@ def execute(
     server_url: str, aiperf_cli: str, tokenizer: str | None, duration: int,
     dataset_loader: str, served_model_name: str | None, metrics_url: str | None,
     warmup_requests_per_lane: int, failed_request_threshold: float, fast: bool,
-    github: dict[str, Any],
+    github: dict[str, Any], hf_cache_dir: Path, dataset_configuration_timeout: int,
 ) -> dict[str, Any]:
     stem = result_filename(project, entry)
     job_dir = jobs_root / stem
@@ -244,7 +391,11 @@ def execute(
         served_model_name=served_model_name, metrics_url=metrics_url,
         warmup_requests_per_lane=warmup_requests_per_lane,
         failed_request_threshold=failed_request_threshold, fast=fast,
-        env_overrides={}, github=github,
+        env_overrides=runtime_environment_overrides(
+            hf_cache_dir, dataset_configuration_timeout,
+        ),
+        github=github, hf_cache_dir=hf_cache_dir,
+        dataset_configuration_timeout=dataset_configuration_timeout,
     )
     record: dict[str, Any] = {
         "entry": entry, "result_filename": stem, "command": command,

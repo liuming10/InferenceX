@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -34,7 +35,10 @@ def materialize(artifacts: Path, destination: Path, *, result_prefix: str = "all
     return staged
 
 
-def collect(*, python: Path, artifacts: Path, aggregates: Path, result_prefix: str = "all") -> Path | None:
+def collect(
+    *, python: Path, artifacts: Path, aggregates: Path, result_prefix: str = "all",
+    project_root: Path | None = None,
+) -> Path | None:
     """Summarize local eval artifacts and write ``agg_eval_<prefix>.json``.
 
     The collector's standard output replaces ``GITHUB_STEP_SUMMARY`` and is
@@ -44,10 +48,14 @@ def collect(*, python: Path, artifacts: Path, aggregates: Path, result_prefix: s
     staged = materialize(artifacts, input_root, result_prefix=result_prefix)
     if not staged:
         return None
+    env = dict(os.environ)
+    if project_root is not None:
+        inherited = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = str(project_root) if not inherited else os.pathsep.join((str(project_root), inherited))
     completed = subprocess.run(
         [str(python), "-m", "infx.results.collect_eval_results", str(input_root), result_prefix],
         cwd=aggregates,
-        text=True,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )

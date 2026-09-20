@@ -112,7 +112,9 @@ def ensure_initialized_submodules(root: Path) -> None:
         )
 
 
-def supplied_project(path: Path, *, allow_dirty: bool) -> Project:
+def supplied_project(
+    path: Path, *, allow_dirty: bool, validate_submodules: bool = True,
+) -> Project:
     """Resolve a user-supplied immutable project tree."""
     root = path.resolve()
     if not root.is_dir():
@@ -134,7 +136,8 @@ def supplied_project(path: Path, *, allow_dirty: bool) -> Project:
             "--project-dir has tracked or untracked changes; pass --allow-dirty-project "
             "only when intentionally benchmarking that exact modified tree"
         )
-    ensure_initialized_submodules(root)
+    if validate_submodules:
+        ensure_initialized_submodules(root)
     python = venv_python(root)
     verify_python(root, python)
     return Project(root, python, "project-dir", head_sha, remote, dirty)
@@ -168,13 +171,15 @@ def managed_project(
 
 def resolve_project(
     *, project_dir: Path | None, workspace_root: Path, repository: str | None,
-    ref: str, allow_dirty: bool,
+    ref: str, allow_dirty: bool, validate_submodules: bool = False,
 ) -> Project:
-    """Resolve either a supplied project or an executor-owned checkout."""
+    """Resolve a supplied project or managed checkout with optional Git submodule checks."""
     if project_dir is not None:
         if repository is not None:
             raise WorkflowError("--project-dir and --repository cannot be used together")
-        return supplied_project(project_dir, allow_dirty=allow_dirty)
+        return supplied_project(
+            project_dir, allow_dirty=allow_dirty, validate_submodules=validate_submodules,
+        )
     if not repository:
         raise WorkflowError("supply --project-dir or --repository")
     return managed_project(workspace_root, repository, ref)

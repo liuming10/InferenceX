@@ -20,6 +20,7 @@ def test_stage_agentic_with_eval_keeps_all_workflow_categories(tmp_path: Path) -
 
     (job / "server.log").write_text("server", encoding="utf-8")
     (results.parent / "benchmark.log").write_text("benchmark", encoding="utf-8")
+    (results.parent / "agentic_power_timezone_offset.txt").write_text("+0800\n", encoding="utf-8")
 
     stage_job_output(
         job, artifact_root,
@@ -33,6 +34,7 @@ def test_stage_agentic_with_eval_keeps_all_workflow_categories(tmp_path: Path) -
     assert (artifact_root / "eval_run" / "results_eval.json").is_file()
     assert (artifact_root / "server_logs_run" / "results" / "server.log").is_file()
     assert (artifact_root / "server_logs_run" / "results" / "benchmark.log").is_file()
+    assert (artifact_root / "power_audit_run" / "results" / "agentic_power_timezone_offset.txt").is_file()
     assert not (artifact_root / "logs" / "run").exists()
 
 
