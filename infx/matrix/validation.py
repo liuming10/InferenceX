@@ -518,10 +518,13 @@ def _validate_conc_fields(self):
 
 
 def _validate_agentic_runner_is_cluster(runner: str, scenarios) -> None:
-    if scenarios.agentic_coding and not runner.startswith(CLUSTER_LABEL_PREFIX):
+    if scenarios.agentic_coding and not (
+        runner.startswith(CLUSTER_LABEL_PREFIX) or runner == "dcu-hygon_00"
+    ):
         raise ValueError(
             f"Agentic master configs must use a '{CLUSTER_LABEL_PREFIX}<name>' runner "
-            "so every point runs on one exact hardware fleet."
+            "or the dedicated dcu-hygon_00 runner so every point runs on one exact "
+            "hardware fleet."
         )
 
 

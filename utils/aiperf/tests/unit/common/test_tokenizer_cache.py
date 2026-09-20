@@ -250,6 +250,43 @@ class TestTokenizerOnlyRepoCacheLoad:
         assert "local_files_only" not in seen
 
 
+class TestLocalTokenizerDirectory:
+    def test_offline_load_uses_existing_local_directory_directly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An existing local tokenizer directory must bypass Hub snapshot lookup."""
+        local_tokenizer = tmp_path / "DeepSeek-V4-Flash"
+        local_tokenizer.mkdir()
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+
+        def fail_snapshot_download(*args, **kwargs):
+            pytest.fail("local tokenizer directories must not call snapshot_download")
+
+        monkeypatch.setattr("huggingface_hub.snapshot_download", fail_snapshot_download)
+        seen: dict[str, object] = {}
+
+        def fake_from_pretrained(name_or_path, **kwargs):
+            seen["name_or_path"] = name_or_path
+            seen.update(kwargs)
+            return _FakeHfTokenizer()
+
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            side_effect=fake_from_pretrained,
+        ):
+            result = Tokenizer.from_pretrained(
+                str(local_tokenizer),
+                trust_remote_code=True,
+            )
+
+        assert result.resolved_name == str(local_tokenizer)
+        assert seen["name_or_path"] == str(local_tokenizer)
+        assert seen["trust_remote_code"] is True
+        assert "revision" not in seen
+        assert "local_files_only" not in seen
+
+
 class _FakeHfTokenizer:
     """Minimal stub that satisfies ``Tokenizer._apply_kwarg_overrides``."""
 

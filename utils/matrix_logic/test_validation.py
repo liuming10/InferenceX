@@ -1237,8 +1237,8 @@ class TestMasterConfigEntries:
         with pytest.raises(ValidationError, match="disagg"):
             SingleNodeMasterConfigEntry(**valid_single_node_master_config)
 
-    def test_single_node_agentic_master_config_requires_cluster_runner(self):
-        """Single-node agentic configs must pin an exact cluster label."""
+    def test_single_node_agentic_master_config_requires_dedicated_runner(self):
+        """Agentic configs use a cluster label or the dedicated DCU runner."""
         config = {
             "image": "vllm/vllm-openai:test",
             "model": "deepseek-ai/DeepSeek-V4-Pro",
@@ -1263,6 +1263,9 @@ class TestMasterConfigEntries:
 
         config["runner"] = "cluster:b200-nscale"
         assert SingleNodeMasterConfigEntry(**config).runner == "cluster:b200-nscale"
+
+        config["runner"] = "dcu-hygon_00"
+        assert SingleNodeMasterConfigEntry(**config).runner == "dcu-hygon_00"
 
     def test_multinode_agentic_master_config_requires_cluster_runner(self):
         """Multinode agentic configs must also pin an exact cluster label."""

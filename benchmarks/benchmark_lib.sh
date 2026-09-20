@@ -2865,6 +2865,7 @@ AIPERF_RUNTIME_DIR="${AIPERF_RUNTIME_DIR:-${TMPDIR:-/tmp}/inferencex-agentic-${S
 AIPERF_VENV="${AIPERF_VENV:-${AIPERF_RUNTIME_DIR}/venv}"
 AIPERF_UV_INSTALL_DIR="${AIPERF_UV_INSTALL_DIR:-${AIPERF_RUNTIME_DIR}/uv/bin}"
 AIPERF_UV_CACHE_DIR="${AIPERF_UV_CACHE_DIR:-${AIPERF_RUNTIME_DIR}/uv-cache}"
+AIPERF_PYPI_INDEX_URL="${AIPERF_PYPI_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 AIPERF_PYTHON="${AIPERF_VENV}/bin/python"
 AIPERF_CLI="${AIPERF_VENV}/bin/aiperf"
 AIPERF_HF_CLI="${AIPERF_VENV}/bin/hf"
@@ -2927,7 +2928,7 @@ install_agentic_deps() {
     UV_CACHE_DIR="$AIPERF_UV_CACHE_DIR" \
         "$AIPERF_UV_BIN" venv --python "${AIPERF_PYTHON_VERSION:-3.11}" "$AIPERF_VENV" || return $?
     UV_CACHE_DIR="$AIPERF_UV_CACHE_DIR" UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=3 \
-        "$AIPERF_UV_BIN" pip install --python "$AIPERF_PYTHON" \
+        "$AIPERF_UV_BIN" pip install --index-url "$AIPERF_PYPI_INDEX_URL" --python "$AIPERF_PYTHON" \
         -r "$AGENTIC_DIR/requirements.txt" \
         -e "$AIPERF_DIR" \
         "datasets>=4.7.0" \
@@ -2973,6 +2974,7 @@ resolve_trace_source() {
     esac
     local loader="${WEKA_LOADER_OVERRIDE:-$default_loader}"
     local dataset
+    export HF_ENDPOINT=https://hf-mirror.com
     case "$loader" in
         semianalysis_cc_traces_weka_with_subagents)
             dataset="semianalysisai/cc-traces-weka-061526"

@@ -318,3 +318,6 @@ hardware:
   cluster:dcu-hygon:
     available-cpu-dram-mib: 980_223
     gpus-per-node: 8
+  dcu-hygon_00:
+    available-cpu-dram-mib: 980_223
+    gpus-per-node: 8

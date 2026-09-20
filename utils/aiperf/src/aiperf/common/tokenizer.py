@@ -530,6 +530,16 @@ class Tokenizer:
 
         _ensure_deepseek_v32_config_registered()
 
+        local_path = Path(name).expanduser()
+        if local_path.is_dir():
+            return cls._build_with_kwargs(
+                AutoTokenizer.from_pretrained(
+                    str(local_path),
+                    trust_remote_code=trust_remote_code,
+                ),
+                resolved_name=name,
+            )
+
         if _is_offline_mode():
             tokenizer_instance = cls._from_pretrained_local(
                 AutoTokenizer.from_pretrained,

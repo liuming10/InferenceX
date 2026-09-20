@@ -363,6 +363,9 @@ jobs:
     steps:
       - name: Slurm cleanup (pre-run)
         run: &slurm-cleanup |
+          # This template intentionally does not perform host-wide Docker cleanup.
+          # Only Slurm jobs owned by the current user and matching these names are
+          # cancelled, so unrelated users' jobs and Docker containers are preserved.
           if command -v squeue >/dev/null 2>&1; then
             for job_name in "${{ runner.name }}" "inferencex-${{ runner.name }}"; do
               echo "[Slurm] Cleaning up jobs named: $job_name ..."
@@ -405,7 +408,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
           clean: true
-          submodules: true
+          submodules: false
 
       - name: Launch multi-node job script
         env:
