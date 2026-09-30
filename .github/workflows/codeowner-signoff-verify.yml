@@ -213,7 +213,7 @@ jobs:
           token: ${{ secrets.CLAUDE_PAT }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       # The verifier prompt lives in .github/codeowner-signoff-verify-prompt.md:
       # GitHub caps any ${{ }}-bearing workflow scalar at 21000 characters and
@@ -237,7 +237,7 @@ jobs:
           wc -c /tmp/codeowner-signoff-verify-prompt.md
 
       - name: Verify sign-off with Claude
-        uses: anthropics/claude-code-action@9cdae7f0d995e3ba7c33f226087fdf82a59cd520 # v1.0.223
+        uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_PAT }}
           GITHUB_TOKEN: ${{ secrets.CLAUDE_PAT }}

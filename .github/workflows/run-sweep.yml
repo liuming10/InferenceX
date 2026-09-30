@@ -108,7 +108,7 @@ jobs:
                   fi
 
             - name: Set up uv
-              uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+              uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
             - name: Validate perf-changelog matrix
               env:
@@ -234,14 +234,14 @@ jobs:
               with:
                   fetch-depth: 0
 
-            - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+            - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
             - name: Classify priority criteria
               id: classify
               if: >-
                   vars.PRIORITY_SCHEDULER_ENABLED == 'true' &&
                   github.event_name == 'pull_request'
               continue-on-error: true
-              uses: anthropics/claude-code-action@9cdae7f0d995e3ba7c33f226087fdf82a59cd520 # v1.0.223
+              uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235
               with:
                   github_token: ${{ github.token }}
                   anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -1059,7 +1059,7 @@ jobs:
                   pattern: results_*
 
             - name: Set up uv
-              uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+              uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
             - name: Calculate success rate
               run: >-
@@ -1096,7 +1096,7 @@ jobs:
                   pattern: results_bmk
 
             - name: Set up uv
-              uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+              uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
             - name: Compare results against main
               run: >-
