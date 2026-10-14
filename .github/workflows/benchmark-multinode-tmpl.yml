@@ -524,14 +524,14 @@ jobs:
 
       - name: Upload result
         if: ${{ success() && env.RESULT_FILENAME != '' && !inputs.eval-only && inputs.scenario-type != 'agentic-coding' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bmk_${{ env.RESULT_FILENAME }}
           path: agg_${{ env.RESULT_FILENAME }}_*.json
 
       - name: Upload power audit bundle
         if: ${{ always() && !inputs.eval-only }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: power_audit_${{ env.RESULT_FILENAME }}
           path: |
@@ -549,7 +549,7 @@ jobs:
 
       - name: Upload server logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: multinode_server_logs_${{ env.RESULT_FILENAME }}
           # multinode launchers package server logs into this tarball.
@@ -558,14 +558,14 @@ jobs:
 
       - name: Upload agentic aggregated result
         if: ${{ always() && !inputs.eval-only && inputs.scenario-type == 'agentic-coding' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bmk_agentic_${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}_conc*.json
 
       - name: Upload agentic raw results
         if: ${{ always() && inputs.scenario-type == 'agentic-coding' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agentic_${{ env.RESULT_FILENAME }}
           path: |
@@ -576,7 +576,7 @@ jobs:
 
       - name: Upload eval results (if any)
         if: ${{ always() && (env.RUN_EVAL == 'true' || inputs.eval-only) }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: eval_${{ env.EXP_NAME }}_${{ env.PRECISION }}_${{ env.FRAMEWORK }}_p${{ env.PREFILL_NUM_WORKERS }}x${{ env.PREFILL_TP }}p${{ env.PREFILL_PP_SIZE }}c${{ env.PREFILL_DCP_SIZE }}k${{ env.PREFILL_PCP_SIZE }}e${{ env.PREFILL_EP }}d${{ env.PREFILL_DP_ATTN }}_d${{ env.DECODE_NUM_WORKERS }}x${{ env.DECODE_TP }}p${{ env.DECODE_PP_SIZE }}c${{ env.DECODE_DCP_SIZE }}k${{ env.DECODE_PCP_SIZE }}e${{ env.DECODE_EP }}d${{ env.DECODE_DP_ATTN }}_g${{ env.DISAGG }}_r${{ env.EVAL_ARTIFACT_RECIPE }}_c${{ env.EVAL_ARTIFACT_CONC }}_kv${{ env.KV_OFFLOADING }}-${{ env.KV_OFFLOAD_BACKEND }}_spec${{ env.SPEC_DECODING }}_${{ env.EVAL_FRAMEWORK }}_${{ env.EVAL_SUITE }}_${{ runner.name }}_${{ github.run_attempt }}
           path: |
